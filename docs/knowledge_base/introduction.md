@@ -32,6 +32,13 @@ The Datus Agent Knowledge Base is a multi-modal intelligence system that transfo
 - **Capabilities**: Find queries by intent, get similar queries, learn patterns
 - **Use**: Knowledge sharing, optimization through examples, team onboarding
 
+### 4. [Warehouse Layer Standards](modeling_layers.md)
+**Purpose**: Provide ODS/DIM/DWD/DWS/ADS presets for naming, partitioning, and retention when generating semantic models.
+
+- **Stores**: Layer definitions, naming conventions, retention guidance, and scaffold templates
+- **Capabilities**: Classify tables into warehouse layers and apply consistent semantic modeling defaults
+- **Use**: Align semantic models and metrics to enterprise data modeling standards
+
 ## How It Works
 
 1. **Data Ingestion**: Initialize components via `datus bootstrap-kb` command with various data sources

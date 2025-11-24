@@ -2,6 +2,7 @@
 # Licensed under the Apache License, Version 2.0.
 # See http://www.apache.org/licenses/LICENSE-2.0 for details.
 
+import copy
 import os
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Dict, List, Optional
@@ -76,6 +77,32 @@ class MetricMeta:
     def filter_kwargs(cls, kwargs):
         valid_fields = {f.name for f in fields(cls)}
         return MetricMeta(**{k: resolve_env(v) for k, v in kwargs.items() if k in valid_fields})
+
+
+@dataclass
+class ModelingRules:
+    naming_conventions: Dict[str, str] = field(default_factory=dict, init=True)
+    layer_mapping: Dict[str, str] = field(default_factory=dict, init=True)
+    retention: Dict[str, str] = field(default_factory=dict, init=True)
+    notes: List[str] = field(default_factory=list, init=True)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @staticmethod
+    def filter_kwargs(cls, kwargs) -> "ModelingRules":
+        valid_fields = {f.name for f in fields(cls)}
+        filtered_kwargs = {}
+        for k, v in kwargs.items():
+            if k not in valid_fields:
+                continue
+            if isinstance(v, dict):
+                filtered_kwargs[k] = {kk: resolve_env(vv) for kk, vv in v.items()}
+            elif isinstance(v, list):
+                filtered_kwargs[k] = [resolve_env(item) for item in v]
+            else:
+                filtered_kwargs[k] = resolve_env(v)
+        return cls(**filtered_kwargs)
 
 
 @dataclass
@@ -159,6 +186,49 @@ DEFAULT_REFLECTION_NODES = {
     ],
 }
 
+DEFAULT_SEMANTIC_LAYER_PRESETS = {
+    "ods": {
+        "label": "Operational Data Store",
+        "purpose": "Land raw/ingested events with minimal transformation for traceability.",
+        "naming": "ods_{source}_{entity}",
+        "partitioning": "Ingestion or event date/time columns; keep ingestion_ts as a high-precision marker.",
+        "retention": "Short-term raw history (30–90 days) aligned to source cadence.",
+        "table_template": "Keys: ingestion_ts, source_system, record_hash. Columns: payload (JSON/VARIANT), record_type, source attributes.",
+    },
+    "dim": {
+        "label": "Conformed Dimension",
+        "purpose": "Curated, de-duplicated entities shared across marts.",
+        "naming": "dim_{subject}",
+        "partitioning": "SCD2 validity (`effective_start_date`/`effective_end_date`) or validity ranges.",
+        "retention": "Long-lived history with carefully versioned changes.",
+        "table_template": "Keys: surrogate key + natural key. Time: effective_start_date/effective_end_date/is_current. Attributes: standardized, deduplicated fields.",
+    },
+    "dwd": {
+        "label": "Detail Warehouse Data",
+        "purpose": "Cleansed, atomic facts at base event/transaction grain.",
+        "naming": "dwd_{subject}_{grain}",
+        "partitioning": "Primary event/transaction date with optional ingestion partitions for late data.",
+        "retention": "Medium-term detail (12–24 months) before archiving.",
+        "table_template": "Keys: fact_id plus foreign keys to dimensions. Time: event_ts primary, ingestion_ts tracking. Measures: raw amounts/status flags.",
+    },
+    "dws": {
+        "label": "Data Warehouse Summary",
+        "purpose": "Reusable summaries/aggregations powering multiple metrics and data products.",
+        "naming": "dws_{subject}_{grain}",
+        "partitioning": "Rollup anchors (summary_date/summary_week) with refresh timestamps for backfills.",
+        "retention": "Medium/long-term depending on downstream use; rebuilt regularly from DWD.",
+        "table_template": "Grain: daily/weekly/monthly. Measures: pre-aggregated sums/counts/averages. Dimensions: join keys for common slices.",
+    },
+    "ads": {
+        "label": "Application Data Service",
+        "purpose": "Presentation-ready serving tables tuned for specific products or dashboards.",
+        "naming": "ads_{audience}_{purpose}",
+        "partitioning": "Consumption-friendly partitions (report_date/snapshot_date) with stable schemas.",
+        "retention": "Aligned to product/reporting horizons; prune deprecated snapshots quickly.",
+        "table_template": "Keys: consumer-facing identifiers. Measures: precomputed KPIs and formatted values. Tracking: snapshot_ts, source_cutoff_ts, data_quality_status.",
+    },
+}
+
 
 def _parse_single_file_db(db_config: Dict[str, Any], dialect: str) -> DbConfig:
     uri = str(db_config["uri"])
@@ -202,6 +272,11 @@ class AgentConfig:
         self.nodes = nodes
         self.agentic_nodes = kwargs.get("agentic_nodes", {})
 
+        semantic_layers_config = kwargs.get("semantic_layers", {}) or {}
+        self.semantic_layer_presets = copy.deepcopy(DEFAULT_SEMANTIC_LAYER_PRESETS)
+        if isinstance(semantic_layers_config, dict):
+            self.semantic_layer_presets.update(semantic_layers_config)
+
         for name, raw_config in self.agentic_nodes.items():
             if not raw_config.get("system_prompt"):
                 raw_config["system_prompt"] = name
@@ -230,6 +305,7 @@ class AgentConfig:
         self._init_namespace_config(kwargs.get("namespace", {}))
 
         self.metric_meta = {k: MetricMeta.filter_kwargs(MetricMeta, v) for k, v in kwargs.get("metrics", {}).items()}
+        self.modeling_rules = ModelingRules.filter_kwargs(ModelingRules, kwargs.get("modeling", {}))
         self.workspace_root = None
         # use default embedding model if not provided
         if storage_config := kwargs.get("storage", {}):

@@ -128,6 +128,58 @@ agent:
       layer2: layer2
       ext_knowledge: ""
 
+  semantic_layers:
+    ods:
+      label: "Operational Data Store"
+      purpose: "Raw ingestion with minimal transformation"
+      naming: "ods_{source}_{entity}"
+      partitioning: "ingestion_date or event_date; keep ingestion_ts"
+      retention: "30-90 days of replayable history"
+      table_template: "Keys: ingestion_ts, source_system, record_hash; Columns: payload JSON"
+    dim:
+      label: "Conformed Dimension"
+      purpose: "Shared, deduplicated entities"
+      naming: "dim_{subject}"
+      partitioning: "SCD2 effective dates and is_current flags"
+      retention: "Long-lived history"
+      table_template: "Keys: surrogate and natural keys; Time: effective_start_date/effective_end_date"
+    dwd:
+      label: "Detail Warehouse Data"
+      purpose: "Cleansed, atomic facts at base event/transaction grain"
+      naming: "dwd_{subject}_{grain}"
+      partitioning: "event_date or transaction_date plus ingestion tracking"
+      retention: "12-24 months of detail before archiving"
+      table_template: "Keys: fact_id and dimension FKs; Time: event_ts and ingestion_ts; Measures: raw amounts/status flags"
+    dws:
+      label: "Data Warehouse Summary"
+      purpose: "Reusable aggregates for broad consumption"
+      naming: "dws_{subject}_{grain}"
+      partitioning: "summary_date/summary_week anchors with refresh timestamps"
+      retention: "Medium/long-term depending on downstream demand"
+      table_template: "Grain: daily/weekly/monthly; Measures: pre-aggregated sums/counts; Dimensions: join keys for slicing"
+    ads:
+      label: "Application Data Service"
+      purpose: "Presentation-ready layer for products or dashboards"
+      naming: "ads_{audience}_{purpose}"
+      partitioning: "report_date or snapshot_date aligned to publication cadence"
+      retention: "Keep only consumer horizon; prune obsolete snapshots"
+      table_template: "Keys: consumer IDs; Measures: precomputed KPIs; Tracking: snapshot_ts/source_cutoff_ts/data_quality_status"
+  modeling:
+    naming_conventions:
+      tables: snake_case
+      dimensions: dim_<subject>
+      facts: fct_<subject>
+    layer_mapping:
+      raw: bronze
+      cleaned: silver
+      marts: gold
+    retention:
+      staging: 7d
+      marts: 180d
+    notes:
+      - prefer incremental materializations for wide fact tables
+      - keep date dimensions shared across layers
+
   storage:
     # Data path is now fixed at {agent.home}/data
     # Final storage paths: {home}/data/datus_db_{namespace}, {home}/data/sub_agents/{agent_name}, etc.

@@ -376,5 +376,75 @@ For more details about metrics: [Metrics](./metrics/metrics.md)
 - **Ingest user edits from SQLMesh**: If you change SQLMesh metric files directly, re-import them into the agent’s knowledge base and regenerate the corresponding MetricFlow YAML to maintain parity.
 
 See [MetricFlow ↔ SQLMesh Metric Synchronization](../workflow/metricflow_sqlmesh_sync.md) for the end-to-end loop that keeps the agent’s knowledge base consistent when either side changes.
+### **🏗️ 4. SQLMesh Modeling (Build & Deploy)**
+
+Use SQLMesh when you want the agent to propose, build, and deploy transformation models with repeatable conventions.
+
+1. **Install SQLMesh and drivers**
+
+   ```bash
+   pip install "sqlmesh[duckdb]"
+   ```
+
+2. **Initialize a project**
+
+   ```bash
+   mkdir -p ~/sqlmesh/projects/finance
+   cd ~/sqlmesh/projects/finance
+   sqlmesh init
+   ```
+
+3. **Point SQLMesh at the same warehouse as your Datus namespace**
+
+   For DuckDB, align the `config.yaml` connection with your `agent.yml` namespace:
+
+   ```yaml
+   connections:
+     duckdb:
+       type: duckdb
+       database: ~/.datus/sample/duckdb-demo.duckdb
+   default_connection: duckdb
+   ```
+
+4. **Capture modeling rules for reuse**
+
+   Add your naming, layer, and retention rules to `agent.yml` so the agent learns them:
+
+   ```yaml
+   modeling:
+     naming_conventions:
+       dimensions: dim_<subject>
+       facts: fct_<subject>
+     layer_mapping:
+       staging: bronze
+       mart: gold
+     retention:
+       staging: 7d
+   ```
+
+5. **Build and deploy models**
+
+   ```bash
+   sqlmesh plan --gateway dev --auto-apply
+   sqlmesh apply
+   ```
+
+   If you use the generic MCP shell server, you can trigger these from Datus CLI:
+
+   ```bash
+   .mcp add --transport stdio sqlmesh uvx mcp-server-shell --working-directory ~/sqlmesh/projects/finance --command sqlmesh
+   .mcp call sqlmesh.run "plan --gateway dev --auto-apply"
+   .mcp call sqlmesh.run "apply"
+   ```
+
+6. **Link models to the knowledge base**
+
+   After SQLMesh creates or refreshes tables, update Datus metadata so chats know about the new models:
+
+   ```bash
+   datus-agent bootstrap-kb --namespace local_duckdb --kb_update_strategy incremental
+   ```
+
+With SQLMesh wired in, the agent can reuse your modeling rules, introspect freshly built objects via the knowledge base, and orchestrate SQLMesh commands directly from chat.
 
 

@@ -18,6 +18,21 @@ agent:
     # Data path is now fixed at {agent.home}/data (e.g., ~/.datus/data/datus_db_{namespace})
     workspace_root: ~/.datus/workspace
     embedding_device_type: cpu
+  modeling:
+    naming_conventions:
+      tables: snake_case
+      dimensions: dim_<subject>
+      facts: fct_<subject>
+    layer_mapping:
+      raw: bronze
+      cleaned: silver
+      marts: gold
+    retention:
+      staging: 7d
+      marts: 180d
+    notes:
+      - prefer incremental materializations for wide fact tables
+      - keep date dimensions shared across layers
   benchmark:
     california_schools:
       question_file: california_schools.csv

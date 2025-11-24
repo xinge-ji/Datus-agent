@@ -150,13 +150,28 @@ You can customize the root directory by configuring `agent.home` in `agent.yml`.
         "enabled": true
       }
     },
-    "http_server": {
+  "http_server": {
       "type": "http",
       "url": "${HTTP_URL:-https://localhost:8001/mcp}",
       "headers": {
         "Content-Type": "application/json"
       },
       "timeout": 60.0
+    }
+  }
+}
+```
+
+To orchestrate SQLMesh from Datus, wrap the CLI with the shell server and point it at your project directory:
+
+```json
+{
+  "mcpServers": {
+    "sqlmesh": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["mcp-server-shell", "--working-directory", "~/sqlmesh/projects/finance", "--command", "sqlmesh"],
+      "tool_filter": {"enabled": true}
     }
   }
 }
