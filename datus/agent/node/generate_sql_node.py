@@ -12,7 +12,15 @@ from datus.configuration.agent_config import AgentConfig
 from datus.models.base import LLMBaseModel
 from datus.prompts.gen_sql import get_sql_prompt
 from datus.schemas.action_history import ActionHistory, ActionHistoryManager, ActionRole, ActionStatus
-from datus.schemas.node_models import GenerateSQLInput, GenerateSQLResult, SQLContext, SqlTask, TableSchema, TableValue
+from datus.schemas.node_models import (
+    ColumnSearchResult,
+    GenerateSQLInput,
+    GenerateSQLResult,
+    SQLContext,
+    SqlTask,
+    TableSchema,
+    TableValue,
+)
 from datus.storage.schema_metadata import SchemaWithValueRAG
 from datus.utils.constants import DBType
 from datus.utils.loggings import get_logger
@@ -52,6 +60,7 @@ class GenerateSQLNode(Node):
             yield action
 
     def setup_input(self, workflow: Workflow) -> Dict:
+        column_hints = self._maybe_search_columns(workflow)
         if workflow.context.document_result:
             database_docs = "\n Reference documents:\n"
             for _, docs in workflow.context.document_result.docs.items():
@@ -68,7 +77,12 @@ class GenerateSQLNode(Node):
             contexts=workflow.context.sql_contexts,
             external_knowledge=workflow.task.external_knowledge,
             database_docs=database_docs,
+            column_search_results=workflow.context.column_search_results,
+            where_examples=self._build_where_examples(workflow.context.column_search_results),
         )
+        if column_hints:
+            next_input.max_table_schemas_length = self.input.max_table_schemas_length if self.input else 4000
+            next_input.max_data_details_length = self.input.max_data_details_length if self.input else 2000
         self.input = next_input
         return {"success": True, "message": "Schema appears valid", "suggestions": [next_input]}
 
@@ -149,6 +163,68 @@ class GenerateSQLNode(Node):
             logger.warning(f"Failed to get schemas and values for tables {table_names}: {e}")
             return [], []  # Return empty lists if lookup fails
 
+    def _maybe_search_columns(self, workflow: Workflow) -> List[ColumnSearchResult]:
+        """Search columns by keywords when tables are not provided."""
+
+        if workflow.context.table_schemas or workflow.task.tables:
+            return []
+
+        keywords = workflow.task.table_keywords or [workflow.task.task]
+        keywords = [kw.strip() for kw in keywords if kw and kw.strip()]
+        if not keywords:
+            return []
+
+        sql_connector = self._sql_connector(workflow.task.database_name)
+        catalog_name = workflow.task.catalog_name or sql_connector.catalog_name
+        database_name = workflow.task.database_name or sql_connector.database_name
+        schema_name = workflow.task.schema_name or sql_connector.schema_name
+
+        column_results = self.metadata_rag.search_columns_by_keywords(
+            keywords=keywords,
+            catalog_name=catalog_name,
+            database_name=database_name,
+            schema_name=schema_name,
+            table_type=workflow.task.schema_linking_type,
+        )
+
+        if not column_results:
+            return []
+
+        workflow.context.column_search_results = column_results
+        unique_tables = []
+        seen_tables = set()
+        for item in column_results:
+            identifier = item.table_identifier or item.table_name
+            if identifier and identifier not in seen_tables:
+                seen_tables.add(identifier)
+                unique_tables.append(identifier)
+
+        if unique_tables:
+            workflow.task.tables = unique_tables
+            table_schemas, table_values = self._get_schema_and_values(workflow.task, unique_tables)
+            if table_schemas:
+                workflow.context.update_schema_and_values(table_schemas, table_values)
+
+        logger.info(
+            "Auto-located tables via column search: %s", ", ".join(unique_tables) if unique_tables else "none"
+        )
+        return column_results
+
+    @staticmethod
+    def _build_where_examples(column_results: List[ColumnSearchResult]) -> str:
+        if not column_results:
+            return ""
+        examples: List[str] = []
+        seen: set[tuple[str, str]] = set()
+        for result in column_results:
+            key = (result.table_identifier, result.column_name)
+            if not result.column_name or key in seen or not result.keyword:
+                continue
+            seen.add(key)
+            qualified_column = f"{result.table_identifier}.{result.column_name}" if result.table_identifier else result.column_name
+            examples.append(f"-- Keyword '{result.keyword}'\nWHERE {qualified_column} LIKE '%{result.keyword}%' ")
+        return "\n".join(examples)
+
     async def _generate_sql_stream(
         self, action_history_manager: Optional[ActionHistoryManager] = None
     ) -> AsyncGenerator[ActionHistory, None]:
@@ -173,9 +249,15 @@ class GenerateSQLNode(Node):
                     "has_external_knowledge": bool(
                         hasattr(self.input, "external_knowledge") and self.input.external_knowledge
                     ),
+                    "column_search_hits": len(getattr(self.input, "column_search_results", []) or []),
                 },
                 status=ActionStatus.PROCESSING,
             )
+            if getattr(self.input, "column_search_results", None):
+                prep_action.messages += " | Auto-selected tables via keyword column search"
+                prep_action.input["keyword_tables"] = [
+                    result.table_identifier or result.table_name for result in self.input.column_search_results
+                ]
             yield prep_action
 
             # Update preparation status
@@ -243,6 +325,7 @@ def generate_sql(model: LLMBaseModel, input_data: GenerateSQLInput) -> GenerateS
 
     sql_query = ""
     try:
+        column_hints = _format_column_hints(input_data.column_search_results)
         # Format the prompt with schema list
         prompt = get_sql_prompt(
             database_type=input_data.database_type or DBType.SQLITE.value,
@@ -261,6 +344,8 @@ def generate_sql(model: LLMBaseModel, input_data: GenerateSQLInput) -> GenerateS
             database_docs=input_data.database_docs,
             current_date=get_default_current_date(input_data.sql_task.current_date),
             date_ranges=getattr(input_data.sql_task, "date_ranges", ""),
+            column_hints=column_hints,
+            where_examples=input_data.where_examples,
         )
 
         logger.debug(f"Generated SQL prompt:  {type(model)}, {prompt}")
@@ -304,3 +389,16 @@ def generate_sql(model: LLMBaseModel, input_data: GenerateSQLInput) -> GenerateS
     except Exception as e:
         logger.error(f"SQL generation failed: {e}")
         return GenerateSQLResult(success=False, error=str(e), sql_query="")
+
+
+def _format_column_hints(column_results: List[ColumnSearchResult]) -> str:
+    if not column_results:
+        return ""
+    hints: List[str] = []
+    for result in column_results:
+        table_display = result.table_identifier or result.table_name
+        sample = f" sample: {result.sample_rows}" if result.sample_rows else ""
+        keyword_note = f"keyword: '{result.keyword}'" if result.keyword else ""
+        column_part = f".{result.column_name}" if result.column_name else ""
+        hints.append(f"- {table_display}{column_part} ({keyword_note}){sample}")
+    return "\n".join(hints)

@@ -39,6 +39,10 @@ class SqlTask(BaseModel):
     output_dir: str = Field(default="output", description="Output directory path")
     external_knowledge: str = Field(default="", description="External knowledge for the input")
     tables: Optional[List[str]] = Field(default=[], description="List of table names to use")
+    table_keywords: List[str] = Field(
+        default_factory=list,
+        description="Keywords to locate candidate tables or columns when tables are not provided",
+    )
     schema_linking_type: TABLE_TYPE = Field(default="table", description="Schema linking type for the task")
 
     current_date: Optional[str] = Field(
@@ -314,6 +318,43 @@ class TableValue(BaseTableSchema):
         return self.model_dump()
 
 
+class ColumnSearchResult(BaseModel):
+    """Column-level search hint returned by metadata search."""
+
+    identifier: str = Field(default="", description="Unique identifier for the table")
+    catalog_name: str = Field(default="", description="Catalog name")
+    database_name: str = Field(default="", description="Database name")
+    schema_name: str = Field(default="", description="Schema name")
+    table_name: str = Field(default="", description="Table name")
+    column_name: str = Field(default="", description="Column name")
+    keyword: str = Field(default="", description="Matched keyword")
+    sample_rows: str = Field(default="", description="Sample rows for the column")
+
+    @property
+    def table_identifier(self) -> str:
+        if self.identifier:
+            return self.identifier
+        return ".".join(filter(None, [self.catalog_name, self.database_name, self.schema_name, self.table_name]))
+
+    @classmethod
+    def from_arrow(cls, table: pa.Table, keyword: str) -> List["ColumnSearchResult"]:
+        results: List[ColumnSearchResult] = []
+        for index in range(table.num_rows):
+            results.append(
+                cls(
+                    identifier=table["identifier"][index].as_py(),
+                    catalog_name=table["catalog_name"][index].as_py(),
+                    database_name=table["database_name"][index].as_py(),
+                    schema_name=table["schema_name"][index].as_py(),
+                    table_name=table["table_name"][index].as_py(),
+                    column_name=table["column_name"][index].as_py(),
+                    sample_rows=table["sample_rows"][index].as_py() or "",
+                    keyword=keyword,
+                )
+            )
+        return results
+
+
 class Metric(BaseModel):
     """
     Model for metrics information used in SQL generation.
@@ -371,6 +412,10 @@ class GenerateSQLInput(BaseInput):
     max_value_length: int = Field(default=500, description="Max value length")
     max_text_mark_length: int = Field(default=16, description="Max text mark length")
     database_docs: Optional[str] = Field(default="", description="Database documentation")
+    column_search_results: List[ColumnSearchResult] = Field(
+        default_factory=list, description="Column search results to guide SQL generation"
+    )
+    where_examples: str = Field(default="", description="Suggested WHERE clauses from keyword search")
 
 
 class GenerateSQLResult(BaseResult):
@@ -502,6 +547,9 @@ class Context(BaseModel):
     sql_contexts: List[SQLContext] = Field(default_factory=list, description="The SQL contexts")
     table_schemas: List[TableSchema] = Field(default_factory=list, description="The table schemas")
     table_values: List[TableValue] = Field(default_factory=list, description="The table values")
+    column_search_results: List[ColumnSearchResult] = Field(
+        default_factory=list, description="Column search results captured from keyword lookup"
+    )
     metrics: List[Metric] = Field(default_factory=list, description="The metrics")
     doc_search_keywords: List[str] = Field(default_factory=list, description="The document search keywords")
     document_result: Optional[DocSearchResult] = Field(default=None, description="The document result")

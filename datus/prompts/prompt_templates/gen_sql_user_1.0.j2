@@ -1,6 +1,10 @@
 Database Type: {{ database_type }}{{ database_notes }}{{ database_docs }}
 Table Schemas:
 {{ processed_schemas }}
+{% if column_hints %}
+Column Search Hints:
+{{ column_hints }}
+{% endif %}
 Data Details:
 {{ processed_details }}
 Metrics (Semantic Layer):
@@ -12,6 +16,10 @@ Parsed Date Ranges:
 {{ knowledge_content }}
 Natural Language Question:
 {{ question }}
+{% if where_examples %}
+Example WHERE Clauses:
+{{ where_examples }}
+{% endif %}
 Context:
 {{ processed_context }}
 Current Date: {{ current_date }}
