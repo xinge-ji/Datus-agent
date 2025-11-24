@@ -263,3 +263,27 @@ nodes:
 
 * Recommended: `claude-4-sonnet`, `gpt-4-turbo`
 * Good for formatting: `anthropic` models
+
+## Semantic Modeling Layer Presets
+
+Use the optional `semantic_layers` block at the root of `agent.yml` to override the defaults used by the semantic model generator. Presets help the agent classify tables into ODS/DIM/DWD/DWS/ADS and scaffold naming, partitioning, and retention hints consistently.
+
+```yaml
+semantic_layers:
+  ods:
+    label: "Operational Data Store"
+    purpose: "Raw ingestion with minimal transformation"
+    naming: "ods_{source}_{entity}"
+    partitioning: "ingestion_date or event_date; keep ingestion_ts"
+    retention: "30-90 days of replayable history"
+    table_template: "Keys: ingestion_ts, source_system, record_hash; Columns: payload JSON"
+  dim:
+    label: "Conformed Dimension"
+    purpose: "Shared, deduplicated entities"
+    naming: "dim_{subject}"
+    partitioning: "SCD2 effective dates and is_current flags"
+    retention: "Long-lived history"
+    table_template: "Keys: surrogate and natural keys; Time: effective_start_date/effective_end_date"
+```
+
+If omitted, the agent falls back to the built-in defaults documented in `knowledge_base/modeling_layers.md`.

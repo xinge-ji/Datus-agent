@@ -95,6 +95,7 @@ Action nodes perform specific data processing and SQL-related tasks.
   - Identifies business dimensions and measures
   - Defines table semantics
   - Creates reusable data models
+- **Layering**: Classifies tables into ODS/DIM/DWD/DWS/ADS using warehouse presets to drive naming, partitioning, and retention (see `knowledge_base/modeling_layers.md`)
 - **Output**: Semantic model definitions for business intelligence
 
 #### Search Metrics Node
