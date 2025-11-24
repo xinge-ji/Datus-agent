@@ -288,6 +288,7 @@ class SemanticAgenticNode(AgenticNode):
         context["native_tools"] = ", ".join([tool.name for tool in self.tools]) if self.tools else "None"
         context["mcp_tools"] = ", ".join(list(self.mcp_servers.keys())) if self.mcp_servers else "None"
         context["semantic_model_dir"] = self.semantic_model_dir
+        context["semantic_layer_presets"] = getattr(self.agent_config, "semantic_layer_presets", {})
 
         # Handle subject_tree context based on whether predefined or query from storage
         if self.subject_tree:
