@@ -177,6 +177,19 @@ MCP configurations support environment variable expansion:
 .mcp call metricflow.query_metrics --metrics revenue --dimensions customer_segment
 ```
 
+### SQLMesh Integration
+
+Wrap the SQLMesh CLI with a shell-based MCP server so Datus can orchestrate plan/apply cycles from chat.
+
+```bash
+# Expose SQLMesh commands from your project directory
+.mcp add --transport stdio sqlmesh uvx mcp-server-shell --working-directory ~/sqlmesh/projects/finance --command sqlmesh
+
+# Plan and deploy models
+.mcp call sqlmesh.run "plan --gateway dev --auto-apply"
+.mcp call sqlmesh.run "apply"
+```
+
 ### Filesystem Integration
 
 ```bash

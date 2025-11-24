@@ -128,6 +128,22 @@ agent:
       layer2: layer2
       ext_knowledge: ""
 
+  modeling:
+    naming_conventions:
+      tables: snake_case
+      dimensions: dim_<subject>
+      facts: fct_<subject>
+    layer_mapping:
+      raw: bronze
+      cleaned: silver
+      marts: gold
+    retention:
+      staging: 7d
+      marts: 180d
+    notes:
+      - prefer incremental materializations for wide fact tables
+      - keep date dimensions shared across layers
+
   storage:
     # Data path is now fixed at {agent.home}/data
     # Final storage paths: {home}/data/datus_db_{namespace}, {home}/data/sub_agents/{agent_name}, etc.

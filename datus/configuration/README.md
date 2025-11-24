@@ -11,6 +11,7 @@ The configuration system is built on a YAML-based structure that allows flexible
 - **Database Connections**: Support for SQLite, MySQL, DuckDB, Snowflake, StarRocks
 - **Workflow Plans**: Define execution pipelines with parallel processing
 - **Storage**: Vector database configuration for RAG capabilities
+- **Modeling Rules**: Persistent SQL modeling standards and retention policies
 - **Benchmarks**: Support for bird_dev, spider2, and semantic layer benchmarks
 
 ## Files Structure
@@ -93,7 +94,29 @@ Configure vector storage for RAG functionality:
       target_model: openai # the openai config
 ```
 
-### 5. Workflow Plans
+### 5. Modeling Rules
+
+Persist SQL modeling standards the agent should reuse across sessions. These rules are stored alongside other agent settings so the LLM can learn from past project decisions.
+
+```yaml
+  modeling:
+    naming_conventions:
+      tables: snake_case            # Preferred casing for tables/models
+      dimensions: dim_<subject>     # Prefixing rule for dimension models
+      facts: fct_<subject>          # Prefixing rule for fact models
+    layer_mapping:
+      raw: bronze                   # Map project layer names to business terminology
+      cleaned: silver
+      marts: gold
+    retention:
+      staging: 7d                   # Retention policy for transient objects
+      marts: 180d                   # Retention policy for serving layers
+    notes:
+      - prefer incremental materializations for wide fact tables
+      - keep date dimensions shared across layers
+```
+
+### 6. Workflow Plans
 
 Define execution workflows:
 
