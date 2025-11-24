@@ -3,6 +3,7 @@
 # See http://www.apache.org/licenses/LICENSE-2.0 for details.
 
 import os
+import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 import csv
 from io import StringIO
@@ -322,6 +323,8 @@ class SchemaWithValueRAG:
         if len(values) == 0:
             return
 
+        column_type_map = self._build_column_type_map(schemas)
+
         final_values = []
         for item in values:
             if "sample_rows" not in item or not item["sample_rows"]:
@@ -330,7 +333,7 @@ class SchemaWithValueRAG:
             if isinstance(sample_rows, list):
                 sample_rows = json2csv(sample_rows)
             item["sample_rows"] = sample_rows
-            final_values.extend(self._expand_sample_rows_by_column(item))
+            final_values.extend(self._expand_sample_rows_by_column(item, column_type_map))
         self.value_store.store_batch(final_values)
 
         logger.debug(f"Batch stored {len(schemas)} schemas, {len(final_values)} values")
@@ -584,7 +587,64 @@ class SchemaWithValueRAG:
         return schemas_result, values_result
 
     @staticmethod
-    def _expand_sample_rows_by_column(item: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _build_column_type_map(schemas: Optional[List[Dict[str, Any]]]) -> Dict[str, Dict[str, str]]:
+        column_type_map: Dict[str, Dict[str, str]] = {}
+        if not schemas:
+            return column_type_map
+
+        for schema in schemas:
+            identifier = schema.get("identifier", "")
+            definition = schema.get("definition", "")
+            if not identifier or not definition:
+                continue
+
+            column_types = SchemaWithValueRAG._parse_column_types_from_definition(definition)
+            if column_types:
+                column_type_map[identifier] = column_types
+
+        return column_type_map
+
+    @staticmethod
+    def _parse_column_types_from_definition(definition: str) -> Dict[str, str]:
+        match = re.search(r"\((.*)\)", definition, re.DOTALL)
+        if not match:
+            return {}
+
+        columns_block = match.group(1)
+        column_defs = [segment.strip() for segment in re.split(r",\s*(?![^()]*\))", columns_block)]
+        column_types: Dict[str, str] = {}
+        for col_def in column_defs:
+            if not col_def:
+                continue
+            upper_def = col_def.upper()
+            if upper_def.startswith(("PRIMARY KEY", "UNIQUE", "CONSTRAINT", "FOREIGN", "KEY", "INDEX")):
+                continue
+            parts = col_def.split()
+            if len(parts) < 2:
+                continue
+            column_name = parts[0].strip('"`[]')
+            column_type = parts[1]
+            column_types[column_name] = column_type
+        return column_types
+
+    @staticmethod
+    def _is_textual_type(column_type: Optional[str]) -> bool:
+        if not column_type:
+            return True
+        upper_type = column_type.upper()
+        text_keywords = ["CHAR", "VARCHAR", "TEXT", "STRING", "NCHAR", "NVARCHAR", "CLOB", "JSON"]
+        return any(keyword in upper_type for keyword in text_keywords)
+
+    @staticmethod
+    def _truncate_value(value: str, max_length: int = 512) -> str:
+        if len(value) <= max_length:
+            return value
+        return value[:max_length] + "...(truncated)"
+
+    @staticmethod
+    def _expand_sample_rows_by_column(
+        item: Dict[str, Any], column_type_map: Optional[Dict[str, Dict[str, str]]] = None
+    ) -> List[Dict[str, Any]]:
         column_records: List[Dict[str, Any]] = []
         sample_rows = item.get("sample_rows")
         if not sample_rows:
@@ -594,10 +654,12 @@ class SchemaWithValueRAG:
         if not reader.fieldnames:
             return column_records
 
+        column_types = (column_type_map or {}).get(item.get("identifier", ""), {})
+
         column_values: Dict[str, List[str]] = {field: [] for field in reader.fieldnames}
         for row in reader:
             for column_name, value in row.items():
-                column_values[column_name].append("" if value is None else str(value))
+                column_values[column_name].append("" if value is None else SchemaWithValueRAG._truncate_value(str(value)))
 
         base_fields = {
             "identifier": item.get("identifier", ""),
@@ -611,6 +673,10 @@ class SchemaWithValueRAG:
         for column_name, values in column_values.items():
             if not values:
                 continue
+
+            if not SchemaWithValueRAG._is_textual_type(column_types.get(column_name)):
+                continue
+
             column_records.append(
                 {
                     **base_fields,
