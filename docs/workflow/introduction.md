@@ -81,3 +81,4 @@ print(result["result"]) # The query results
 - Learn about [workflow orchestration](orchestration.md) to understand how workflows are executed
 - Explore the [API documentation](api.md) for programmatic access
 - Deep dive into [individual nodes](nodes.md) to understand each component
+- Review [MetricFlow ↔ SQLMesh metric synchronization](metricflow_sqlmesh_sync.md) to keep semantic and deployment layers aligned even when SQLMesh projects change.

@@ -369,4 +369,12 @@ metric:
 
 For more details about metrics: [Metrics](./metrics/metrics.md)
 
+#### Keep MetricFlow and SQLMesh metrics in sync
+
+- **Convert MetricFlow metrics to SQLMesh**: After MetricFlow YAML is generated or edited, mirror the metrics as SQLMesh models (for example, under `sqlmesh/models/metrics/`) so downstream deployments stay aligned.
+- **Validate both projects**: Run `mf validate-configs` for MetricFlow and your usual `sqlmesh plan`/`apply` cycle to confirm the translated metrics compile.
+- **Ingest user edits from SQLMesh**: If you change SQLMesh metric files directly, re-import them into the agent’s knowledge base and regenerate the corresponding MetricFlow YAML to maintain parity.
+
+See [MetricFlow ↔ SQLMesh Metric Synchronization](../workflow/metricflow_sqlmesh_sync.md) for the end-to-end loop that keeps the agent’s knowledge base consistent when either side changes.
+
 
