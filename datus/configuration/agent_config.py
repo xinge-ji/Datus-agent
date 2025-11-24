@@ -80,6 +80,32 @@ class MetricMeta:
 
 
 @dataclass
+class ModelingRules:
+    naming_conventions: Dict[str, str] = field(default_factory=dict, init=True)
+    layer_mapping: Dict[str, str] = field(default_factory=dict, init=True)
+    retention: Dict[str, str] = field(default_factory=dict, init=True)
+    notes: List[str] = field(default_factory=list, init=True)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @staticmethod
+    def filter_kwargs(cls, kwargs) -> "ModelingRules":
+        valid_fields = {f.name for f in fields(cls)}
+        filtered_kwargs = {}
+        for k, v in kwargs.items():
+            if k not in valid_fields:
+                continue
+            if isinstance(v, dict):
+                filtered_kwargs[k] = {kk: resolve_env(vv) for kk, vv in v.items()}
+            elif isinstance(v, list):
+                filtered_kwargs[k] = [resolve_env(item) for item in v]
+            else:
+                filtered_kwargs[k] = resolve_env(v)
+        return cls(**filtered_kwargs)
+
+
+@dataclass
 class ModelConfig:
     type: str
     base_url: str
@@ -279,6 +305,7 @@ class AgentConfig:
         self._init_namespace_config(kwargs.get("namespace", {}))
 
         self.metric_meta = {k: MetricMeta.filter_kwargs(MetricMeta, v) for k, v in kwargs.get("metrics", {}).items()}
+        self.modeling_rules = ModelingRules.filter_kwargs(ModelingRules, kwargs.get("modeling", {}))
         self.workspace_root = None
         # use default embedding model if not provided
         if storage_config := kwargs.get("storage", {}):
