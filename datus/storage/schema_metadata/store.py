@@ -12,7 +12,7 @@ from lancedb.rerankers import Reranker
 
 from datus.configuration.agent_config import AgentConfig
 from datus.schemas.base import TABLE_TYPE
-from datus.schemas.node_models import TableSchema, TableValue
+from datus.schemas.node_models import ColumnSearchResult, TableSchema, TableValue
 from datus.storage.base import BaseEmbeddingStore, WhereExpr
 from datus.storage.embedding_models import EmbeddingModel
 from datus.storage.lancedb_conditions import Node, and_, build_where, eq, or_
@@ -426,7 +426,7 @@ class SchemaWithValueRAG:
         schema_name: str = "",
         table_type: TABLE_TYPE = "table",
         top_n: int = 10,
-    ) -> pa.Table:
+        ) -> pa.Table:
         return self.value_store.search_columns_by_keyword(
             query_text=query_text,
             catalog_name=catalog_name,
@@ -435,6 +435,40 @@ class SchemaWithValueRAG:
             table_type=table_type,
             top_n=top_n,
         )
+
+    def search_columns_by_keywords(
+        self,
+        keywords: List[str],
+        catalog_name: str = "",
+        database_name: str = "",
+        schema_name: str = "",
+        table_type: TABLE_TYPE = "table",
+        top_n: int = 5,
+    ) -> List[ColumnSearchResult]:
+        """Search columns for a list of keywords and return structured hints."""
+
+        hints: List[ColumnSearchResult] = []
+        seen: Set[tuple[str, str]] = set()
+
+        for keyword in keywords:
+            sanitized_keyword = keyword.strip()
+            if not sanitized_keyword:
+                continue
+            column_table = self.search_columns(
+                query_text=sanitized_keyword,
+                catalog_name=catalog_name,
+                database_name=database_name,
+                schema_name=schema_name,
+                table_type=table_type,
+                top_n=top_n,
+            )
+            for result in ColumnSearchResult.from_arrow(column_table, sanitized_keyword):
+                key = (result.table_identifier, result.column_name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                hints.append(result)
+        return hints
 
     def search_tables(
         self,

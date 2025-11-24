@@ -31,6 +31,8 @@ def get_sql_prompt(
     database_docs: str = "",
     current_date: str = None,
     date_ranges: str = "",
+    column_hints: str = "",
+    where_examples: str = "",
 ) -> List[Dict[str, str]]:
     if context is None:
         context = []
@@ -93,6 +95,8 @@ def get_sql_prompt(
         database_docs=database_docs,
         current_date=current_date,
         date_ranges=date_ranges,
+        column_hints=column_hints,
+        where_examples=where_examples,
     )
 
     return [
