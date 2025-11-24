@@ -2,6 +2,7 @@
 # Licensed under the Apache License, Version 2.0.
 # See http://www.apache.org/licenses/LICENSE-2.0 for details.
 
+import copy
 import os
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Dict, List, Optional
@@ -159,6 +160,49 @@ DEFAULT_REFLECTION_NODES = {
     ],
 }
 
+DEFAULT_SEMANTIC_LAYER_PRESETS = {
+    "ods": {
+        "label": "Operational Data Store",
+        "purpose": "Land raw/ingested events with minimal transformation for traceability.",
+        "naming": "ods_{source}_{entity}",
+        "partitioning": "Ingestion or event date/time columns; keep ingestion_ts as a high-precision marker.",
+        "retention": "Short-term raw history (30–90 days) aligned to source cadence.",
+        "table_template": "Keys: ingestion_ts, source_system, record_hash. Columns: payload (JSON/VARIANT), record_type, source attributes.",
+    },
+    "dim": {
+        "label": "Conformed Dimension",
+        "purpose": "Curated, de-duplicated entities shared across marts.",
+        "naming": "dim_{subject}",
+        "partitioning": "SCD2 validity (`effective_start_date`/`effective_end_date`) or validity ranges.",
+        "retention": "Long-lived history with carefully versioned changes.",
+        "table_template": "Keys: surrogate key + natural key. Time: effective_start_date/effective_end_date/is_current. Attributes: standardized, deduplicated fields.",
+    },
+    "dwd": {
+        "label": "Detail Warehouse Data",
+        "purpose": "Cleansed, atomic facts at base event/transaction grain.",
+        "naming": "dwd_{subject}_{grain}",
+        "partitioning": "Primary event/transaction date with optional ingestion partitions for late data.",
+        "retention": "Medium-term detail (12–24 months) before archiving.",
+        "table_template": "Keys: fact_id plus foreign keys to dimensions. Time: event_ts primary, ingestion_ts tracking. Measures: raw amounts/status flags.",
+    },
+    "dws": {
+        "label": "Data Warehouse Summary",
+        "purpose": "Reusable summaries/aggregations powering multiple metrics and data products.",
+        "naming": "dws_{subject}_{grain}",
+        "partitioning": "Rollup anchors (summary_date/summary_week) with refresh timestamps for backfills.",
+        "retention": "Medium/long-term depending on downstream use; rebuilt regularly from DWD.",
+        "table_template": "Grain: daily/weekly/monthly. Measures: pre-aggregated sums/counts/averages. Dimensions: join keys for common slices.",
+    },
+    "ads": {
+        "label": "Application Data Service",
+        "purpose": "Presentation-ready serving tables tuned for specific products or dashboards.",
+        "naming": "ads_{audience}_{purpose}",
+        "partitioning": "Consumption-friendly partitions (report_date/snapshot_date) with stable schemas.",
+        "retention": "Aligned to product/reporting horizons; prune deprecated snapshots quickly.",
+        "table_template": "Keys: consumer-facing identifiers. Measures: precomputed KPIs and formatted values. Tracking: snapshot_ts, source_cutoff_ts, data_quality_status.",
+    },
+}
+
 
 def _parse_single_file_db(db_config: Dict[str, Any], dialect: str) -> DbConfig:
     uri = str(db_config["uri"])
@@ -201,6 +245,11 @@ class AgentConfig:
         self._current_database = ""
         self.nodes = nodes
         self.agentic_nodes = kwargs.get("agentic_nodes", {})
+
+        semantic_layers_config = kwargs.get("semantic_layers", {}) or {}
+        self.semantic_layer_presets = copy.deepcopy(DEFAULT_SEMANTIC_LAYER_PRESETS)
+        if isinstance(semantic_layers_config, dict):
+            self.semantic_layer_presets.update(semantic_layers_config)
 
         for name, raw_config in self.agentic_nodes.items():
             if not raw_config.get("system_prompt"):
