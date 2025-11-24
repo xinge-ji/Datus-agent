@@ -397,7 +397,7 @@ class DBFuncTool:
             sample_rows: List[Dict[str, Any]] = []
             if sample_values:
                 if simple_sample_data:
-                    selected_fields = ["identifier", "table_type", "sample_rows", "_distance"]
+                    selected_fields = ["identifier", "table_type", "column_name", "sample_rows", "_distance"]
                 else:
                     selected_fields = [
                         "identifier",
@@ -406,6 +406,7 @@ class DBFuncTool:
                         "schema_name",
                         "table_type",
                         "table_name",
+                        "column_name",
                         "sample_rows",
                         "_distance",
                     ]

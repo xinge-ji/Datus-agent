@@ -4,6 +4,8 @@
 
 import os
 from typing import Any, Dict, List, Optional, Set, Tuple
+import csv
+from io import StringIO
 
 import pyarrow as pa
 from lancedb.rerankers import Reranker
@@ -51,12 +53,10 @@ class BaseMetadataStorage(BaseEmbeddingStore):
         embedding_model: EmbeddingModel,
         table_name: str,
         vector_source_name: str,
+        schema: Optional[pa.Schema] = None,
     ):
-        super().__init__(
-            db_path=db_path,
-            table_name=table_name,
-            embedding_model=embedding_model,
-            schema=pa.schema(
+        if schema is None:
+            schema = pa.schema(
                 [
                     pa.field("identifier", pa.string()),
                     pa.field("catalog_name", pa.string()),
@@ -67,7 +67,12 @@ class BaseMetadataStorage(BaseEmbeddingStore):
                     pa.field(vector_source_name, pa.string()),
                     pa.field("vector", pa.list_(pa.float32(), list_size=embedding_model.dim_size)),
                 ]
-            ),
+            )
+        super().__init__(
+            db_path=db_path,
+            table_name=table_name,
+            embedding_model=embedding_model,
+            schema=schema,
             vector_source_name=vector_source_name,
         )
         self.reranker = None
@@ -227,11 +232,73 @@ class SchemaValueStorage(BaseMetadataStorage):
             embedding_model=embedding_model,
             table_name="schema_value",
             vector_source_name="sample_rows",
+            schema=pa.schema(
+                [
+                    pa.field("identifier", pa.string()),
+                    pa.field("catalog_name", pa.string()),
+                    pa.field("database_name", pa.string()),
+                    pa.field("schema_name", pa.string()),
+                    pa.field("table_name", pa.string()),
+                    pa.field("table_type", pa.string()),
+                    pa.field("column_name", pa.string()),
+                    pa.field("sample_rows", pa.string()),
+                    pa.field("vector", pa.list_(pa.float32(), list_size=embedding_model.dim_size)),
+                ]
+            ),
         )
         self.reranker = None
-        # self.reranker = CrossEncoderReranker(
-        #     model_name="BAAI/bge-reranker-large", device=get_device(), column="sample_rows"
-        # )
+
+    def create_indices(self):
+        self._ensure_table_ready()
+        try:
+            self.table.create_scalar_index("database_name", replace=True)
+            self.table.create_scalar_index("catalog_name", replace=True)
+            self.table.create_scalar_index("schema_name", replace=True)
+            self.table.create_scalar_index("table_name", replace=True)
+            self.table.create_scalar_index("table_type", replace=True)
+            self.table.create_scalar_index("column_name", replace=True)
+        except Exception as e:
+            logger.warning(f"Failed to create scalar index for {self.table_name} table: {str(e)}")
+
+        self.create_vector_index()
+        self.create_fts_index([
+            "database_name",
+            "schema_name",
+            "table_name",
+            "column_name",
+            self.vector_source_name,
+        ])
+
+    def search_columns_by_keyword(
+        self,
+        query_text: str,
+        catalog_name: str = "",
+        database_name: str = "",
+        schema_name: str = "",
+        table_type: TABLE_TYPE = "table",
+        top_n: int = 10,
+    ) -> pa.Table:
+        where = _build_where_clause(
+            catalog_name=catalog_name,
+            database_name=database_name,
+            schema_name=schema_name,
+            table_type=table_type,
+        )
+        return self.search(
+            query_text,
+            top_n=top_n,
+            where=where,
+            select_fields=[
+                "identifier",
+                "catalog_name",
+                "database_name",
+                "schema_name",
+                "table_name",
+                "table_type",
+                "column_name",
+                "sample_rows",
+            ],
+        )
 
 
 class SchemaWithValueRAG:
@@ -263,7 +330,7 @@ class SchemaWithValueRAG:
             if isinstance(sample_rows, list):
                 sample_rows = json2csv(sample_rows)
             item["sample_rows"] = sample_rows
-            final_values.append(item)
+            final_values.extend(self._expand_sample_rows_by_column(item))
         self.value_store.store_batch(final_values)
 
         logger.debug(f"Batch stored {len(schemas)} schemas, {len(final_values)} values")
@@ -349,6 +416,24 @@ class SchemaWithValueRAG:
         """
         return self.value_store.search_all(
             catalog_name=catalog_name, database_name=database_name, schema_name=schema_name, table_type=table_type
+        )
+
+    def search_columns(
+        self,
+        query_text: str,
+        catalog_name: str = "",
+        database_name: str = "",
+        schema_name: str = "",
+        table_type: TABLE_TYPE = "table",
+        top_n: int = 10,
+    ) -> pa.Table:
+        return self.value_store.search_columns_by_keyword(
+            query_text=query_text,
+            catalog_name=catalog_name,
+            database_name=database_name,
+            schema_name=schema_name,
+            table_type=table_type,
+            top_n=top_n,
         )
 
     def search_tables(
@@ -444,24 +529,63 @@ class SchemaWithValueRAG:
         )
         schemas_result = TableSchema.from_arrow(schema_results)
 
-        value_results = (
-            value_query.select(
-                [
-                    "identifier",
-                    "catalog_name",
-                    "database_name",
-                    "schema_name",
-                    "table_name",
-                    "table_type",
-                    "sample_rows",
-                ]
-            )
-            .limit(len(tables))
-            .to_arrow()
+            value_results = (
+                value_query.select(
+                    [
+                        "identifier",
+                        "catalog_name",
+                        "database_name",
+                        "schema_name",
+                        "table_name",
+                        "table_type",
+                        "column_name",
+                        "sample_rows",
+                    ]
+                )
+                .limit(len(tables))
+                .to_arrow()
         )
         values_result = TableValue.from_arrow(value_results)
 
         return schemas_result, values_result
+
+    @staticmethod
+    def _expand_sample_rows_by_column(item: Dict[str, Any]) -> List[Dict[str, Any]]:
+        column_records: List[Dict[str, Any]] = []
+        sample_rows = item.get("sample_rows")
+        if not sample_rows:
+            return column_records
+
+        reader = csv.DictReader(StringIO(sample_rows))
+        if not reader.fieldnames:
+            return column_records
+
+        column_values: Dict[str, List[str]] = {field: [] for field in reader.fieldnames}
+        for row in reader:
+            for column_name, value in row.items():
+                column_values[column_name].append("" if value is None else str(value))
+
+        base_fields = {
+            "identifier": item.get("identifier", ""),
+            "catalog_name": item.get("catalog_name", ""),
+            "database_name": item.get("database_name", ""),
+            "schema_name": item.get("schema_name", ""),
+            "table_name": item.get("table_name", ""),
+            "table_type": item.get("table_type", "table"),
+        }
+
+        for column_name, values in column_values.items():
+            if not values:
+                continue
+            column_records.append(
+                {
+                    **base_fields,
+                    "column_name": column_name,
+                    "sample_rows": f"{column_name}:{' | '.join(values)}",
+                }
+            )
+
+        return column_records
 
     def remove_data(
         self,

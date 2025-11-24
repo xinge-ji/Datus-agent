@@ -165,6 +165,7 @@ class TableValue(BaseTableSchema):
     """Model for table value information returned by schema linking."""
 
     table_values: str = Field(..., description="Sample values from the table")
+    column_name: str | None = Field(default=None, description="Column name for the sample value")
     table_type: str = Field("table", description="Type of the schema")
 
     def to_prompt(
@@ -285,6 +286,7 @@ class TableValue(BaseTableSchema):
             database_name=data.get("database_name", ""),
             schema_name=data.get("schema_name", ""),
             table_values=data["table_values"] if "table_values" in data else data["sample_rows"],
+            column_name=data.get("column_name"),
             table_type=data.get("table_type", "table"),
         )
 
@@ -300,6 +302,9 @@ class TableValue(BaseTableSchema):
                     database_name=table["database_name"][index].as_py(),
                     schema_name=table["schema_name"][index].as_py(),
                     table_values=table["sample_rows"][index].as_py(),
+                    column_name=table.get_column("column_name")[index].as_py()
+                    if "column_name" in table.column_names
+                    else None,
                     table_type=table["table_type"][index].as_py(),
                 )
             )
