@@ -164,6 +164,21 @@ agent:
       partitioning: "report_date or snapshot_date aligned to publication cadence"
       retention: "Keep only consumer horizon; prune obsolete snapshots"
       table_template: "Keys: consumer IDs; Measures: precomputed KPIs; Tracking: snapshot_ts/source_cutoff_ts/data_quality_status"
+  modeling:
+    naming_conventions:
+      tables: snake_case
+      dimensions: dim_<subject>
+      facts: fct_<subject>
+    layer_mapping:
+      raw: bronze
+      cleaned: silver
+      marts: gold
+    retention:
+      staging: 7d
+      marts: 180d
+    notes:
+      - prefer incremental materializations for wide fact tables
+      - keep date dimensions shared across layers
 
   storage:
     # Data path is now fixed at {agent.home}/data
