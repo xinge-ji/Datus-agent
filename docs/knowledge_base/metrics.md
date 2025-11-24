@@ -127,6 +127,12 @@ f"{domain}_{layer1}_{layer2}_{semantic_model}_{metric_name}"
 - **overwrite**: Completely rebuild metrics library
 - **incremental**: Incrementally update new metrics
 
+### 4. MetricFlow ↔ SQLMesh synchronization
+
+- **Convert generated MetricFlow metrics into SQLMesh metric/models** so deployment projects stay aligned with the semantic layer.
+- **Validate both sides** after every change (`mf validate-configs` and your SQLMesh `plan`/`apply` workflow) to keep definitions compiling.
+- **Reload knowledge from SQLMesh when users edit the project directly** by re-ingesting the updated SQLMesh metric files and regenerating the matching MetricFlow YAML so both layers remain consistent.
+
 ## Best Practices
 
 ### 1. Data Preparation
