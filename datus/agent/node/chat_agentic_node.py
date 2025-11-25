@@ -18,7 +18,7 @@ from datus.configuration.agent_config import AgentConfig
 from datus.schemas.action_history import ActionHistory, ActionHistoryManager, ActionRole, ActionStatus
 from datus.schemas.chat_agentic_node_models import ChatNodeInput, ChatNodeResult
 from datus.tools.db_tools.db_manager import db_manager_instance
-from datus.tools.func_tool import ContextSearchTools, DateParsingTools, DBFuncTool, FilesystemFuncTool
+from datus.tools.func_tool import ContextSearchTools, DateParsingTools, DBFuncTool, FilesystemFuncTool, OracleViewTools
 from datus.utils.loggings import get_logger
 
 logger = get_logger(__name__)
@@ -89,6 +89,7 @@ class ChatAgenticNode(AgenticNode):
         self.context_search_tools: ContextSearchTools
         self.date_parsing_tools: Optional[DateParsingTools] = None
         self.filesystem_func_tool: Optional[FilesystemFuncTool] = None
+        self.oracle_view_tools: Optional[OracleViewTools] = None
         self.plan_mode_active = False
         self.plan_hooks = None
 
@@ -205,6 +206,7 @@ class ChatAgenticNode(AgenticNode):
             + self.context_search_tools.available_tools()
             + (self.date_parsing_tools.available_tools() if self.date_parsing_tools else [])
             + (self.filesystem_func_tool.available_tools() if self.filesystem_func_tool else [])
+            + (self.oracle_view_tools.available_tools() if self.oracle_view_tools else [])
         )
 
     def setup_tools(self):
@@ -216,6 +218,7 @@ class ChatAgenticNode(AgenticNode):
         self.context_search_tools = ContextSearchTools(self.agent_config)
         self._setup_date_parsing_tools()
         self._setup_filesystem_tools()
+        self.oracle_view_tools = OracleViewTools()
         self._rebuild_tools()
 
     def _setup_date_parsing_tools(self):
