@@ -9,12 +9,17 @@ from typing import Any, Dict, List, Optional, Sequence
 from agents import Tool
 
 from datus.configuration.agent_config import AgentConfig
+from datus.schemas.agent_models import SubAgentConfig
 from datus.storage.metric.store import SemanticMetricsRAG
 from datus.storage.reference_sql.store import ReferenceSqlRAG
 from datus.tools.func_tool.base import FuncToolResult, trans_to_function_tool
 from datus.utils.loggings import get_logger
 
 logger = get_logger(__name__)
+
+_NAME = "context_search_tools"
+_NAME_METRICS = "context_search_tools.search_metrics"
+_NAME_SQL = "context_search_tools.search_reference_sql"
 
 
 class ContextSearchTools:
@@ -23,8 +28,26 @@ class ContextSearchTools:
         self.sub_agent_name = sub_agent_name
         self.metric_rag = SemanticMetricsRAG(agent_config, sub_agent_name)
         self.reference_sql_store = ReferenceSqlRAG(agent_config, sub_agent_name)
+        if sub_agent_name:
+            self.sub_agent_config = SubAgentConfig.model_validate(self.agent_config.sub_agent_config(sub_agent_name))
+        else:
+            self.sub_agent_config = None
         self.has_metrics = self.metric_rag.get_metrics_size() > 0
         self.has_reference_sql = self.reference_sql_store.get_reference_sql_size() > 0
+
+    def _show_metrics(self):
+        return self.has_metrics and (
+            not self.sub_agent_config
+            or _NAME in self.sub_agent_config.tool_list
+            or _NAME_METRICS in self.sub_agent_config.tool_list
+        )
+
+    def _show_sql(self):
+        return self.has_reference_sql and (
+            not self.sub_agent_config
+            or _NAME in self.sub_agent_config.tool_list
+            or _NAME_SQL in self.sub_agent_config.tool_list
+        )
 
     def available_tools(self) -> List[Tool]:
         tools = []
@@ -94,6 +117,8 @@ class ContextSearchTools:
         layer_map[item_type] = layer_map.get(item_type, 0) + 1
 
     def _collect_metrics_entries(self) -> Sequence[Dict[str, Any]]:
+        if not self._show_metrics():
+            return []
         try:
             return self.metric_rag.search_all_metrics(select_fields=["domain", "layer1", "layer2", "name"])
         except Exception as exc:  # pragma: no cover - defensive logging
@@ -101,6 +126,8 @@ class ContextSearchTools:
             return []
 
     def _collect_sql_entries(self) -> Sequence[Dict[str, Any]]:
+        if not self._show_sql():
+            return []
         try:
             return self.reference_sql_store.search_all_reference_sql(
                 selected_fields=["domain", "layer1", "layer2", "name"]
@@ -148,12 +175,7 @@ class ContextSearchTools:
         self, query_text: str, domain: str = "", layer1: str = "", layer2: str = "", top_n: int = 5
     ) -> FuncToolResult:
         """
-        Perform a vector search to match reference SQL queries by intent.
-
-        **Application Guidance**: If matches are found, MUST reuse the 'sql' directly if it aligns perfectly, or adjust
-        minimally (e.g., change table names or add conditions). Avoid generating new SQL.
-        Example: If reference SQL is "SELECT * FROM users WHERE active=1" for "active users", reuse or adjust to
-        "SELECT * FROM users WHERE active=1 AND join_date > '2023'".
+        Search for reference SQL queries using natural language queries.
 
         Args:
             query_text: The natural language query text representing the desired SQL intent.

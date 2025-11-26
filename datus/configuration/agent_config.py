@@ -113,6 +113,7 @@ class ModelConfig:
     model: str
     save_llm_trace: bool = False
     enable_thinking: bool = False
+    default_headers: Optional[Dict[str, str]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -712,6 +713,7 @@ def load_model_config(data: dict) -> ModelConfig:
         model=resolve_env(data["model"]),
         save_llm_trace=data.get("save_llm_trace", False),
         enable_thinking=data.get("enable_thinking", False),
+        default_headers=data.get("default_headers"),
     )
 
 
