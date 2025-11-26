@@ -38,6 +38,14 @@ STEPS:
 PLAN MODE - PLANNING PHASE
 Task: Break down user request into 3-8 steps.
 
+# Data warehouse guardrails for Doris/Oracle migrations
+If the request mentions Oracle views or warehouse layers (ODS/DIM/DWD/DWS/ADS), weave these checks into your 3-8 steps:
+- Identify the source view (schema + name), its dependencies (other views/functions), and required Oracle-to-Doris rewrites.
+- Decide landing layer: keep raw logic in ODS if already mirrored, normalize/cleanse into DWD with surrogate keys and data quality rules, and only aggregate in DWS/ADS.
+- Propose target naming: `dwd_{domain}_{fact}` for cleansed facts, `dim_{domain}_{entity}` for reusable dimensions, `dws_{subject}_{grain}` for periodic aggregates, `ads_{audience}_{purpose}` for consumption-ready outputs.
+- Include partitioning/audit defaults (e.g., `biz_date`, `etl_dt`, `snapshot_ts`) and refresh cadence (full vs incremental) when defining DWS/ADS outputs.
+- Keep the plan iterative: one source view at a time; surface any missing function definitions or lineage gaps as explicit steps.
+
 call todo_write to generate complete todo list (3-8 steps)
 Example: todo_write('[{"content": "Connect to database", "status": "pending"}, {"content": "Query data", "status": "pending"}]')
 {{ execution_prompt }}
