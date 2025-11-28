@@ -194,6 +194,12 @@ class InteractiveInit:
                 "model": "qwen-plus",
                 "options": ["qwen3-max", "qwen3-coder", "qwen-plus", "qwen-flash"],
             },
+            "zhipu": {
+                "type": "zhipu",
+                "base_url": "https://open.bigmodel.cn/api/paas/v4",
+                "model": "glm-4.6",
+                "options": ["glm-4.6", "glm-4.5", "glm-4.5-air"],
+            },
         }
 
         provider = Prompt.ask("- Which LLM provider?", choices=list(providers.keys()), default="openai")
@@ -416,6 +422,7 @@ class InteractiveInit:
                 "claude": "ClaudeModel",
                 "qwen": "QwenModel",
                 "gemini": "GeminiModel",
+                "zhipu": "ZhipuModel",
             }
 
             if model_type not in type_map:

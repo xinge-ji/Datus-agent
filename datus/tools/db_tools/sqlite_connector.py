@@ -348,6 +348,8 @@ class SQLiteConnector(BaseSqlConnector):
             if filter_tables and table_name not in filter_tables:
                 continue
 
+            columns_meta = self._collect_column_metadata(table_name)
+
             schema_list.append(
                 {
                     "identifier": self.identifier(
@@ -360,10 +362,42 @@ class SQLiteConnector(BaseSqlConnector):
                     "table_name": table_name,
                     "definition": definition,
                     "table_type": table_type,
+                    "columns": columns_meta,
                 }
             )
 
         return schema_list
+
+    def _collect_column_metadata(self, table_name: str) -> List[Dict[str, Any]]:
+        """Collect column name/type and first 5 distinct values for a table."""
+        cols: List[Dict[str, Any]] = []
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(f'PRAGMA table_info("{table_name}")')
+            rows = cursor.fetchall()
+            for col in rows:
+                column_name = str(col[1])
+                column_datatype = str(col[2] or "")
+                column_values: List[Any] = []
+                try:
+                    values_sql = (
+                        f'SELECT DISTINCT "{column_name}" FROM "{table_name}" '
+                        f'WHERE "{column_name}" IS NOT NULL LIMIT 5'
+                    )
+                    values_res = cursor.execute(values_sql).fetchall()
+                    column_values = [str(val[0]) if isinstance(val, tuple) else str(val) for val in values_res]
+                except Exception as exc:
+                    logger.debug(f"Skip distinct values for {table_name}.{column_name}: {exc}")
+                cols.append(
+                    {
+                        "column_name": column_name,
+                        "column_datatype": column_datatype,
+                        "column_values": column_values,
+                    }
+                )
+        except Exception as exc:
+            logger.warning(f"Failed to collect column metadata for {table_name}: {exc}")
+        return cols
 
     @override
     def get_tables_with_ddl(

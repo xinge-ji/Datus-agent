@@ -230,7 +230,10 @@ class ChatAgenticNode(AgenticNode):
         """Setup filesystem tools (all available tools)."""
         try:
             root_path = self._resolve_workspace_root()
-            self.filesystem_func_tool = FilesystemFuncTool(root_path=root_path)
+            include_patterns = []
+            if self.agent_config and hasattr(self.agent_config, "workspace_include_patterns"):
+                include_patterns = self.agent_config.workspace_include_patterns
+            self.filesystem_func_tool = FilesystemFuncTool(root_path=root_path, include_patterns=include_patterns)
             logger.info(f"Setup filesystem tools with root path: {root_path}")
         except Exception as e:
             logger.error(f"Failed to setup filesystem tools: {e}")

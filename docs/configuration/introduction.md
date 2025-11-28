@@ -80,6 +80,33 @@ benchmark:
     database_pattern: "**/*.sqlite"
 ```
 
+## LLM Providers
+
+Define multiple providers under `agent.models` to switch targets per workflow. Example Zhipu GLM (OpenAI-compatible):
+
+```yaml
+models:
+  zhipu-glm:
+    type: "zhipu"
+    base_url: "https://open.bigmodel.cn/api/paas/v4"
+    api_key: "${ZHIPU_API_KEY}"
+    model: "glm-4.6"
+```
+
+You can also call the same endpoint directly:
+
+```bash
+curl --location 'https://open.bigmodel.cn/api/paas/v4/chat/completions' \
+  --header 'Authorization: Bearer YOUR_API_KEY' \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "model": "glm-4.6",
+    "messages": [
+      { "role": "user", "content": "hello" }
+    ]
+  }'
+```
+
 ## Environment Variable Support
 
 All configuration values support environment variable expansion with default values:

@@ -31,6 +31,7 @@ class FilesystemConfig:
         root_path: str = None,
         allowed_extensions: List[str] = None,
         max_file_size: int = 1024 * 1024,
+        include_patterns: Optional[List[str]] = None,
     ):
         self.root_path = root_path or os.getenv("FILESYSTEM_MCP_PATH", os.path.expanduser("~"))
         self.allowed_extensions = allowed_extensions or [
@@ -49,14 +50,15 @@ class FilesystemConfig:
             ".xml",
         ]
         self.max_file_size = max_file_size
+        self.include_patterns = [pattern for pattern in (include_patterns or []) if pattern]
 
 
 class FilesystemFuncTool:
     """Function tool wrapper for filesystem operations"""
 
-    def __init__(self, root_path: str = None):
+    def __init__(self, root_path: str = None, include_patterns: Optional[List[str]] = None):
         self.root_path = root_path or os.getenv("FILESYSTEM_MCP_PATH", os.path.expanduser("~"))
-        self.config = FilesystemConfig(root_path=root_path)
+        self.config = FilesystemConfig(root_path=root_path, include_patterns=include_patterns)
 
     def available_tools(self) -> List[Tool]:
         """Get all available filesystem tools"""
@@ -98,6 +100,53 @@ class FilesystemFuncTool:
             return True
         return file_path.suffix.lower() in self.config.allowed_extensions
 
+    def _relative_to_root(self, path: Path) -> str:
+        """Return path relative to configured root for matching"""
+        try:
+            root = Path(self.config.root_path).resolve()
+            return str(path.resolve(strict=False).relative_to(root))
+        except Exception:
+            return path.as_posix()
+
+    def _matches_include(self, relative_path: str) -> bool:
+        """Check if relative path matches include patterns (or any if none configured)"""
+        if not self.config.include_patterns:
+            return True
+        for pattern in self.config.include_patterns:
+            try:
+                if glob.globmatch(relative_path, pattern, flags=glob.DOTGLOB | glob.GLOBSTAR):
+                    return True
+                if glob.globmatch(f"{relative_path}/", pattern, flags=glob.DOTGLOB | glob.GLOBSTAR):
+                    return True
+                if pattern.endswith("/**") and relative_path.startswith(pattern[:-3]):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _should_descend(self, relative_path: str) -> bool:
+        """Check if we should traverse into a directory based on include patterns."""
+        if not self.config.include_patterns:
+            return True
+        for pattern in self.config.include_patterns:
+            try:
+                if pattern.startswith(relative_path.rstrip("/") + "/"):
+                    return True
+                if glob.globmatch(relative_path, pattern, flags=glob.DOTGLOB | glob.GLOBSTAR):
+                    return True
+                if glob.globmatch(f"{relative_path}/", pattern, flags=glob.DOTGLOB | glob.GLOBSTAR):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _include_error(self, path: Path) -> Optional[str]:
+        """Return error message if path is outside include configuration, else None"""
+        relative_path = self._relative_to_root(path)
+        if not self._matches_include(relative_path):
+            return f"Path is outside allowed include paths: {relative_path}"
+        return None
+
     def read_file(self, path: str) -> FuncToolResult:
         """
         Read the contents of a file.
@@ -116,6 +165,9 @@ class FilesystemFuncTool:
 
             if not target_path or not target_path.exists():
                 return FuncToolResult(success=0, error=f"File not found: {path}")
+
+            if include_msg := self._include_error(target_path):
+                return FuncToolResult(success=0, error=include_msg)
 
             if not target_path.is_file():
                 return FuncToolResult(success=0, error=f"Path is not a file: {path}")
@@ -158,6 +210,10 @@ class FilesystemFuncTool:
                 target_path = self._get_safe_path(path)
                 if not target_path or not target_path.exists():
                     results[path] = f"File not found: {path}"
+                    continue
+
+                if include_msg := self._include_error(target_path):
+                    results[path] = include_msg
                     continue
 
                 if not target_path.is_file():
@@ -204,6 +260,9 @@ class FilesystemFuncTool:
             if not target_path:
                 return FuncToolResult(success=0, error=f"Invalid path: {path}")
 
+            if include_msg := self._include_error(target_path):
+                return FuncToolResult(success=0, error=include_msg)
+
             if not self._is_allowed_file(target_path):
                 return FuncToolResult(success=0, error=f"File type not allowed: {path}")
 
@@ -246,6 +305,9 @@ class FilesystemFuncTool:
 
             if not target_path or not target_path.exists():
                 return FuncToolResult(success=0, error=f"File not found: {path}")
+
+            if include_msg := self._include_error(target_path):
+                return FuncToolResult(success=0, error=include_msg)
 
             if not target_path.is_file():
                 return FuncToolResult(success=0, error=f"Path is not a file: {path}")
@@ -313,6 +375,9 @@ class FilesystemFuncTool:
             if not target_path:
                 return FuncToolResult(success=0, error=f"Invalid path: {path}")
 
+            if include_msg := self._include_error(target_path):
+                return FuncToolResult(success=0, error=include_msg)
+
             try:
                 target_path.mkdir(parents=True, exist_ok=True)
                 return FuncToolResult(result=f"Directory created: {path}")
@@ -345,9 +410,15 @@ class FilesystemFuncTool:
             if not target_path.is_dir():
                 return FuncToolResult(success=0, error=f"Path is not a directory: {path}")
 
+            if include_msg := self._include_error(target_path):
+                return FuncToolResult(success=0, error=include_msg)
+
             try:
                 items = []
                 for item in sorted(target_path.iterdir()):
+                    rel = self._relative_to_root(item)
+                    if not self._matches_include(rel):
+                        continue
                     item_info = {"name": item.name, "type": "directory" if item.is_dir() else "file"}
                     items.append(item_info)
 
@@ -381,6 +452,9 @@ class FilesystemFuncTool:
             if not target_path.is_dir():
                 return FuncToolResult(success=0, error=f"Path is not a directory: {path}")
 
+            if include_msg := self._include_error(target_path):
+                return FuncToolResult(success=0, error=include_msg)
+
             try:
 
                 def build_tree(dir_path: Path, prefix: str = "") -> List[str]:
@@ -388,12 +462,18 @@ class FilesystemFuncTool:
                     items = sorted(dir_path.iterdir())
 
                     for i, item in enumerate(items):
+                        rel = self._relative_to_root(item)
+                        if item.is_dir():
+                            if not self._should_descend(rel):
+                                continue
+                        elif not self._matches_include(rel):
+                            continue
                         is_last = i == len(items) - 1
-                        current_prefix = "└── " if is_last else "├── "
+                        current_prefix = "`-- " if is_last else "|-- "
 
                         if item.is_dir():
                             lines.append(f"{prefix}{current_prefix}{item.name}/")
-                            next_prefix = prefix + ("    " if is_last else "│   ")
+                            next_prefix = prefix + ("    " if is_last else "|   ")
                             lines.extend(build_tree(item, next_prefix))
                         else:
                             try:
@@ -440,6 +520,11 @@ class FilesystemFuncTool:
             if not dest_path:
                 return FuncToolResult(success=0, error=f"Invalid destination: {destination}")
 
+            if include_msg := self._include_error(source_path):
+                return FuncToolResult(success=0, error=include_msg)
+            if include_msg := self._include_error(dest_path):
+                return FuncToolResult(success=0, error=include_msg)
+
             try:
                 source_path.rename(dest_path)
                 return FuncToolResult(result=f"Moved {source} to {destination}")
@@ -476,7 +561,11 @@ class FilesystemFuncTool:
             if not target_path.is_dir():
                 return FuncToolResult(success=0, error=f"Path is not a directory: {path}")
 
+            if include_msg := self._include_error(target_path):
+                return FuncToolResult(success=0, error=include_msg)
+
             exclude_patterns = exclude_patterns or []
+            include_patterns = self.config.include_patterns
 
             try:
                 matches = []
@@ -517,6 +606,13 @@ class FilesystemFuncTool:
 
                         for item in current_path.iterdir():
                             try:
+                                item_rel = self._relative_to_root(item)
+
+                                if item.is_dir() and not self._should_descend(item_rel):
+                                    continue
+                                if item.is_file() and not self._matches_include(item_rel):
+                                    continue
+
                                 if should_exclude(item):
                                     continue
 
@@ -557,6 +653,6 @@ class FilesystemFuncTool:
             return FuncToolResult(success=0, error=str(e))
 
 
-def filesystem_function_tools(root_path: str = None) -> List[Tool]:
+def filesystem_function_tools(root_path: str = None, include_patterns: Optional[List[str]] = None) -> List[Tool]:
     """Get filesystem function tools"""
-    return FilesystemFuncTool(root_path=root_path).available_tools()
+    return FilesystemFuncTool(root_path=root_path, include_patterns=include_patterns).available_tools()

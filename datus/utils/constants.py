@@ -22,6 +22,7 @@ class DBType(str, Enum):
     ORACLE = "oracle"
     HIVE = "hive"
     CLICKZETTA = "clickzetta"
+    DORIS = "doris"
 
     @classmethod
     def support_catalog(cls, db_type: str) -> bool:
@@ -74,6 +75,7 @@ class LLMProvider(str, Enum):
     ANTHROPIC = "anthropic"  # Alternative name for Claude
     GEMINI = "gemini"
     LLAMA = "llama"
+    ZHIPU = "zhipu"
     GPT = "gpt"  # Alternative name for OpenAI
 
 

@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from datus.configuration.agent_config import AgentConfig
 from datus.models.gemini_model import GeminiModel
 from datus.models.openai_model import OpenAIModel
+from datus.models.zhipu_model import ZhipuModel
 from datus.tools.func_tool import db_function_tools
 from datus.utils.exceptions import DatusException, ErrorCode
 from datus.utils.loggings import get_logger
@@ -282,6 +283,53 @@ class TestKimiModel:
                 raise
         except Exception:
             raise
+
+
+class TestZhipuModel:
+    """Test suite for Zhipu (GLM) models."""
+
+    @pytest.fixture(autouse=True)
+    def setup_method(self, agent_config: AgentConfig):
+        """Set up test environment before each test method."""
+
+        # Skip if API key is not available
+        if not os.getenv("ZHIPU_API_KEY") and not os.getenv("GLM_API_KEY"):
+            pytest.skip("ZHIPU_API_KEY or GLM_API_KEY not available")
+
+        self.model_config = agent_config.models.get("zhipu-glm-46")
+        if not self.model_config:
+            pytest.skip("zhipu-glm-46 configuration not found in test config")
+
+        self.model = ZhipuModel(model_config=self.model_config)
+
+    def test_initialization(self):
+        """Test Zhipu model initialization."""
+        assert self.model is not None
+        assert self.model.model_config is not None
+        assert self.model.model_config.model == "glm-4.6"
+        assert self.model.model_config.base_url == "https://open.bigmodel.cn/api/paas/v4"
+        assert self.model.model_config.type == "zhipu"
+
+    def test_generate_basic(self):
+        """Test basic text generation functionality."""
+        result = self.model.generate("Say hello in one word", temperature=0.1, max_tokens=10)
+
+        assert result is not None, "Response should not be None"
+        assert isinstance(result, str), "Response should be a string"
+        assert len(result) > 0, "Response should not be empty"
+
+        logger.info(f"Zhipu generated response: {result}")
+
+    def test_generate_with_json_output(self):
+        """Test JSON output generation."""
+        prompt = "Respond with a JSON object containing 'message': 'hello' and 'language': 'zh'"
+        result = self.model.generate_with_json_output(prompt, temperature=0.1)
+
+        assert result is not None, "Response should not be None"
+        assert isinstance(result, dict), "Response should be a dictionary"
+        assert "message" in result, "Response should contain 'message' key"
+
+        logger.info(f"Zhipu JSON response: {result}")
 
 
 class TestGeminiModel:

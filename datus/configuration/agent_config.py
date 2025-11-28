@@ -137,6 +137,33 @@ class BenchmarkConfig:
             )
 
 
+@dataclass
+class SqlMeshProjectConfig:
+    project_path: str = field(default="", init=True)
+    include_paths: List[str] = field(default_factory=list, init=True)
+
+    @staticmethod
+    def filter_kwargs(cls, kwargs: dict) -> "SqlMeshProjectConfig":
+        valid_fields = {f.name for f in fields(cls)}
+        normalized_kwargs = kwargs.copy()
+        if "include" in normalized_kwargs and "include_paths" not in normalized_kwargs:
+            normalized_kwargs["include_paths"] = normalized_kwargs["include"]
+        params = {}
+        for k, v in normalized_kwargs.items():
+            if k not in valid_fields:
+                continue
+            if k == "include_paths":
+                if isinstance(v, list):
+                    params[k] = [resolve_env(str(item)) for item in v if item]
+                elif isinstance(v, str):
+                    params[k] = [resolve_env(v)]
+                else:
+                    params[k] = []
+            else:
+                params[k] = resolve_env(str(v)) if v else ""
+        return cls(**params)
+
+
 logger = get_logger(__name__)
 
 DEFAULT_REFLECTION_NODES = {
@@ -232,12 +259,21 @@ class AgentConfig:
 
         self.metric_meta = {k: MetricMeta.filter_kwargs(MetricMeta, v) for k, v in kwargs.get("metrics", {}).items()}
         self.workspace_root = None
+        self.workspace_include_patterns: List[str] = []
+        self.sqlmesh: Optional[SqlMeshProjectConfig] = None
         # use default embedding model if not provided
         if storage_config := kwargs.get("storage", {}):
             self.storage_configs = init_embedding_models(
                 storage_config, openai_configs=self.models, default_openai_config=self.active_model()
             )
             self.workspace_root = storage_config.get("workspace_root")
+
+        if sqlmesh_config := kwargs.get("sqlmesh", {}):
+            self.sqlmesh = SqlMeshProjectConfig.filter_kwargs(SqlMeshProjectConfig, sqlmesh_config)
+            if self.sqlmesh.project_path:
+                self.workspace_root = self.sqlmesh.project_path
+            if self.sqlmesh.include_paths:
+                self.workspace_include_patterns = self.sqlmesh.include_paths
 
         self._init_dirs()
 

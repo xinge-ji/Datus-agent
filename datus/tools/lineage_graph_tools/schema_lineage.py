@@ -147,6 +147,7 @@ class SchemaLineageTool(BaseTool):
                 schema_name=table_info.get("schema_name", ""),
                 definition=table_info.get("definition", ""),
                 table_type=table_info.get("table_type", "table"),
+                columns=table_info.get("columns"),
             )
             table_schemas.append(table_schema)
 

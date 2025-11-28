@@ -3,6 +3,7 @@
 # See http://www.apache.org/licenses/LICENSE-2.0 for details.
 
 import os
+import json
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pyarrow as pa
@@ -64,6 +65,7 @@ class BaseMetadataStorage(BaseEmbeddingStore):
                     pa.field("schema_name", pa.string()),
                     pa.field("table_name", pa.string()),
                     pa.field("table_type", pa.string()),
+                    pa.field("columns", pa.string()),
                     pa.field(vector_source_name, pa.string()),
                     pa.field("vector", pa.list_(pa.float32(), list_size=embedding_model.dim_size)),
                 ]
@@ -116,7 +118,7 @@ class BaseMetadataStorage(BaseEmbeddingStore):
             logger.warning(f"Failed to create scalar index for {self.table_name} table: {str(e)}")
 
         # self.create_vector_index()
-        self.create_fts_index(["database_name", "schema_name", "table_name", self.vector_source_name])
+        self.create_fts_index(["database_name", "schema_name", "table_name", "columns", self.vector_source_name])
 
     def search_all(
         self,
@@ -250,6 +252,14 @@ class SchemaWithValueRAG:
         # Process schemas and values in batches of 500
         # batch_size = 500
         if schemas:
+            for item in schemas:
+                if "columns" in item and item["columns"] is not None:
+                    try:
+                        import json
+
+                        item["columns"] = json.dumps(item["columns"])
+                    except Exception as exc:
+                        logger.warning(f"Failed to serialize columns for {item.get('table_name')}: {exc}")
             self.schema_store.store_batch(schemas)
 
         if len(values) == 0:
@@ -384,7 +394,7 @@ class SchemaWithValueRAG:
                 )
             elif len(parts) == 3:
                 # Format: database_name.schema_name.table_name
-                if dialect == DBType.STARROCKS:
+                if dialect == DBType.STARROCKS or dialect == DBType.DORIS:
                     cat, db, sch = parts[0], parts[1], ""
                 else:
                     cat, db, sch = catalog_name, parts[0], parts[1]
@@ -437,7 +447,16 @@ class SchemaWithValueRAG:
         # Search schemas
         schema_results = (
             schema_query.select(
-                ["identifier", "catalog_name", "database_name", "schema_name", "table_name", "table_type", "definition"]
+                [
+                    "identifier",
+                    "catalog_name",
+                    "database_name",
+                    "schema_name",
+                    "table_name",
+                    "table_type",
+                    "definition",
+                    "columns",
+                ]
             )
             .limit(len(tables))
             .to_arrow()
@@ -462,6 +481,60 @@ class SchemaWithValueRAG:
         values_result = TableValue.from_arrow(value_results)
 
         return schemas_result, values_result
+
+    def update_column_values(self, identifier: str, table_name: str, column_name: str, value: str, cap: int = 128) -> int:
+        """
+        Append a value into column_values for a given table/column (best-effort, capped).
+
+        Returns:
+            1 if updated, 0 otherwise.
+        """
+        try:
+            self.schema_store._ensure_table_ready()
+            from datus.storage.lancedb_conditions import build_where, eq
+
+            where_clause = build_where(eq("identifier", identifier))
+            current = (
+                self.schema_store.table.search()
+                .where(where_clause)
+                .select(["columns"])
+                .limit(1)
+                .to_arrow()
+                .to_pylist()
+            )
+            if not current:
+                return 0
+            raw_columns = current[0].get("columns")
+            columns: List[Dict[str, Any]] = []
+            if raw_columns:
+                try:
+                    columns = json.loads(raw_columns) if isinstance(raw_columns, str) else raw_columns
+                except Exception as exc:
+                    logger.warning(
+                        "Skip updating column values for %s.%s because existing metadata "
+                        "failed to deserialize: %s",
+                        table_name,
+                        column_name,
+                        exc,
+                    )
+                    return 0
+            updated = False
+            for col in columns or []:
+                if col.get("column_name") == column_name:
+                    vals = col.get("column_values") or []
+                    if value not in vals:
+                        vals.append(value)
+                        col["column_values"] = vals[-cap:]
+                        updated = True
+                    break
+            if not updated:
+                columns.append({"column_name": column_name, "column_datatype": "", "column_values": [value]})
+
+            self.schema_store.table.update(where=where_clause, values={"columns": json.dumps(columns)})
+            return 1
+        except Exception as exc:
+            logger.debug(f"Failed to update column values for {identifier}: {exc}")
+            return 0
 
     def remove_data(
         self,

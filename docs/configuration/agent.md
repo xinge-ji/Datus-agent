@@ -150,6 +150,22 @@ chat:
 * **model**: LLM model for multi-turn dialogue
 * **max\_turns**: Maximum number of tool-assisted reasoning turns
 
+## SQLMesh Project
+
+Point Datus to a SQLMesh project and declare which subdirectories to include as knowledge/doc sources.
+
+```yaml
+sqlmesh:
+  project_path: /abs/path/to/sqlmesh/project   # Used as workspace_root for filesystem tools
+  include_paths:                               # Glob patterns relative to project_path
+    - "models/**"
+    - "seeds/**"
+    - "docs/**"
+```
+
+* **project_path**: Root directory of the SQLMesh project (also sets `workspace_root` for file tools)
+* **include_paths**: Only paths matching these patterns are scanned/read for files (everything else is ignored)
+
 ## Utility Nodes
 
 ### Date Parser

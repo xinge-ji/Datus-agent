@@ -4,7 +4,7 @@
 
 from typing import Dict, List, Union
 
-from datus.schemas.node_models import Metric, TableSchema, TableValue
+from datus.schemas.node_models import ColumnMetadata, Metric, TableSchema, TableValue
 from datus.utils.constants import DBType
 from datus.utils.loggings import get_logger
 
@@ -35,14 +35,28 @@ def get_sql_prompt(
     if context is None:
         context = []
 
+    columns_map: Dict[str, List[ColumnMetadata]] = {}
     if isinstance(table_schemas, str):
         processed_schemas = table_schemas
     else:
-        processed_schemas = "\n".join(schema.to_prompt(database_type) for schema in table_schemas)
+        for schema in table_schemas:
+            if schema.columns:
+                columns_map[schema.table_name] = schema.columns
+        # Prefer concise column-based prompt when columns exist
+        if any(schema.columns for schema in table_schemas):
+            processed_schemas = "\n".join(schema.to_prompt(database_type, columns_only=True) for schema in table_schemas)
+        else:
+            processed_schemas = "\n".join(schema.to_prompt(database_type) for schema in table_schemas)
 
     if data_details:
         processed_details = "\n---\n".join(
-            detail.to_prompt(database_type, max_value_length, max_text_mark_length, processed_schemas)
+            detail.to_prompt(
+                database_type,
+                max_value_length,
+                max_text_mark_length,
+                processed_schemas,
+                columns=columns_map.get(detail.table_name),
+            )
             for detail in data_details
         )
     else:

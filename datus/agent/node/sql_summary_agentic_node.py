@@ -145,7 +145,12 @@ class SqlSummaryAgenticNode(AgenticNode):
         try:
             from datus.tools.func_tool import trans_to_function_tool
 
-            self.filesystem_func_tool = FilesystemFuncTool(root_path=self.sql_summary_dir)
+            include_patterns = []
+            if self.agent_config and hasattr(self.agent_config, "workspace_include_patterns"):
+                include_patterns = self.agent_config.workspace_include_patterns
+            self.filesystem_func_tool = FilesystemFuncTool(
+                root_path=self.sql_summary_dir, include_patterns=include_patterns
+            )
 
             self.tools.append(trans_to_function_tool(self.filesystem_func_tool.read_file))
             self.tools.append(trans_to_function_tool(self.filesystem_func_tool.read_multiple_files))

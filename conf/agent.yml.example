@@ -28,6 +28,12 @@ agent:
       base_url: https://api.deepseek.com
       api_key: ${DEEPSEEK_API_KEY}
       model: deepseek-chat
+    zhipu:
+      type: zhipu
+      vendor: zhipu
+      base_url: https://open.bigmodel.cn/api/paas/v4
+      api_key: ${ZHIPU_API_KEY}
+      model: glm-4.6
 
   nodes:
     schema_linking:
@@ -57,6 +63,14 @@ agent:
       workspace_root: sql2
       model: anthropic
       max_turns: 25
+
+  # SQLMesh project management (optional)
+  sqlmesh:
+    project_path: /absolute/path/to/your/sqlmesh/project   # Root of the SQLMesh project for file tools
+    include_paths:                                         # Paths (glob style) to include as knowledge/doc roots
+      - "models/**"
+      - "seeds/**"
+      - "docs/**"
 
   # Benchmark data is stored at {agent.home}/benchmark/{name}
   # Supported benchmarks: bird_dev, spider2, semantic_layer and other benchmarks you customize
