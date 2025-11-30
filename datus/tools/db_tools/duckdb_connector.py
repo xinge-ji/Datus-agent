@@ -495,12 +495,6 @@ class DuckdbConnector(BaseSqlConnector, SchemaNamespaceMixin):
                 full_name = ".".join(full_name.split(".")[1:])
             if filter_tables and full_name not in filter_tables:
                 continue
-            columns_meta = self._collect_column_metadata(
-                database_name=str(row_dict["database_name"]),
-                schema_name=str(row_dict["schema_name"]),
-                table_name=table_name,
-            )
-
             result.append(
                 {
                     "identifier": self.identifier(
@@ -514,54 +508,10 @@ class DuckdbConnector(BaseSqlConnector, SchemaNamespaceMixin):
                     "table_name": table_name,
                     "definition": row_dict.get("sql", ""),
                     "table_type": _type,
-                    "columns": columns_meta,
                 }
             )
         return result
 
-    def _collect_column_metadata(self, database_name: str, schema_name: str, table_name: str) -> List[Dict[str, Any]]:
-        """Collect column name/type and first 5 distinct values for a table."""
-        cols: List[Dict[str, Any]] = []
-        schema_name = schema_name or "main"
-        try:
-            query = (
-                "SELECT column_name, data_type FROM information_schema.columns "
-                f"WHERE table_schema = '{schema_name}' AND table_name = '{table_name}' "
-                "ORDER BY ordinal_position"
-            )
-            result = self.connection.execute(query)
-            rows = result.fetchall()
-            col_fields = [desc[0] for desc in result.description]
-            for row in rows:
-                col_data = dict(zip(col_fields, row))
-                column_name = str(col_data.get("column_name"))
-                column_datatype = str(col_data.get("data_type", ""))
-                column_values: List[Any] = []
-                table_full_name = self.full_name(
-                    database_name=database_name,
-                    schema_name=schema_name,
-                    table_name=table_name,
-                )
-                try:
-                    values_sql = (
-                        f'SELECT DISTINCT "{column_name}" FROM {table_full_name} '
-                        f'WHERE "{column_name}" IS NOT NULL LIMIT 5'
-                    )
-                    values_res = self.connection.execute(values_sql).fetchall()
-                    column_values = [str(val[0]) if isinstance(val, tuple) else str(val) for val in values_res]
-                except Exception as exc:
-                    logger.debug(f"Skip distinct values for {table_name}.{column_name}: {exc}")
-
-                cols.append(
-                    {
-                        "column_name": column_name,
-                        "column_datatype": column_datatype,
-                        "column_values": column_values,
-                    }
-                )
-        except Exception as exc:
-            logger.warning(f"Failed to collect column metadata for {table_name}: {exc}")
-        return cols
 
     @override
     def get_views_with_ddl(

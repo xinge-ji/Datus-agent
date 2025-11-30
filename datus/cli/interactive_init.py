@@ -250,14 +250,15 @@ class InteractiveInit:
             return False
 
         # Database type selection
-        db_types = ["sqlite", "duckdb", "snowflake", "mysql", "starrocks"]
+        db_types = ["sqlite", "duckdb", "snowflake", "mysql", "starrocks", "doris"]
         db_type = Prompt.ask("- Database type", choices=db_types, default="duckdb")
 
         # Connection configuration based on database type
-        if db_type in ["starrocks", "mysql"]:
-            # Host-based database configuration (StarRocks/MySQL)
+        if db_type in ["starrocks", "mysql", "doris"]:
+            # Host-based database configuration (StarRocks/MySQL/Doris)
             host = Prompt.ask("- Host", default="127.0.0.1")
-            port = Prompt.ask("- Port", default="9030")
+            default_ports = {"starrocks": "9030", "doris": "9030", "mysql": "3306"}
+            port = Prompt.ask("- Port", default=default_ports.get(db_type, ""))
             username = Prompt.ask("- Username")
             password = getpass("- Password: ")
             database = Prompt.ask("- Database")
@@ -273,9 +274,11 @@ class InteractiveInit:
                 "database": database,
             }
 
-            # Add StarRocks-specific catalog field
+            # Add StarRocks/Doris-specific catalog field
             if db_type == "starrocks":
                 config_data["catalog"] = "default_catalog"
+            elif db_type == "doris":
+                config_data["catalog"] = "internal"
 
             self.config["agent"]["namespace"][self.namespace_name] = config_data
         elif db_type == "snowflake":

@@ -128,14 +128,15 @@ class NamespaceManager:
             return 1
 
         # Database type selection
-        db_types = ["sqlite", "duckdb", "snowflake", "mysql", "starrocks"]
+        db_types = ["sqlite", "duckdb", "snowflake", "mysql", "starrocks", "doris"]
         db_type = Prompt.ask("- Database type", choices=db_types, default="duckdb")
 
         # Connection configuration based on database type
-        if db_type in ["starrocks", "mysql"]:
-            # Host-based database configuration (StarRocks/MySQL)
+        if db_type in ["starrocks", "mysql", "doris"]:
+            # Host-based database configuration (StarRocks/MySQL/Doris)
             host = Prompt.ask("- Host", default="127.0.0.1")
-            default_port = "9030" if db_type == "starrocks" else "3306"
+            default_ports = {"starrocks": "9030", "doris": "9030", "mysql": "3306"}
+            default_port = default_ports.get(db_type, "")
             port = Prompt.ask("- Port", default=default_port)
             valid, error_msg = _validate_port(port)
             if not valid:
@@ -159,6 +160,8 @@ class NamespaceManager:
             # Add StarRocks-specific catalog field
             if db_type == "starrocks":
                 config_data["catalog"] = "default_catalog"
+            elif db_type == "doris":
+                config_data["catalog"] = "internal"
 
         elif db_type == "snowflake":
             # Snowflake specific configuration

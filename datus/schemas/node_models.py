@@ -24,38 +24,6 @@ logger = get_logger(__name__)
 MAX_SQL_RESULT_LENGTH = int(os.getenv("MAX_SQL_RESULT_LENGTH", 2000))
 
 
-def _load_columns(raw: Any) -> Optional[List["ColumnMetadata"]]:
-    """Normalize columns payload into ColumnMetadata list."""
-    if not raw:
-        return None
-    try:
-        if isinstance(raw, str):
-            import json
-
-            raw = json.loads(raw)
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.warning(f"Failed to parse columns metadata: {exc}")
-        return None
-
-    columns: List[ColumnMetadata] = []
-    if isinstance(raw, list):
-        for item in raw:
-            try:
-                columns.append(ColumnMetadata(**item))
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.warning(f"Skip invalid column metadata {item}: {exc}")
-                continue
-    return columns or None
-
-
-class ColumnMetadata(BaseModel):
-    """Column level metadata."""
-
-    column_name: str = Field(..., description="Name of the column")
-    column_datatype: str = Field(..., description="Data type of the column")
-    column_values: List[Any] = Field(default_factory=list, description="First 5 distinct values of the column")
-
-
 class SqlTask(BaseModel):
     """
     Input model for SQL task.
@@ -131,11 +99,8 @@ class TableSchema(BaseTableSchema):
 
     definition: str = Field(..., description="DDL schema text of the table")
     table_type: str = Field("table", description="Type of the schema")
-    columns: Optional[List[ColumnMetadata]] = Field(
-        default=None, description="Column metadata including first 5 distinct values"
-    )
 
-    def to_prompt(self, dialect: str = "snowflake", columns_only: bool = False) -> str:
+    def to_prompt(self, dialect: str = "snowflake") -> str:
         """
         Convert the schema to a concise string representation for LLM prompt.
         Simplifies the schema by:
@@ -148,30 +113,13 @@ class TableSchema(BaseTableSchema):
             A simplified string representation of the table schema
         """
 
-        columns_text = ""
-        if self.columns:
-            # Keep columns concise; include name, type and up to 5 distinct values
-            columns_payload = []
-            for col in self.columns:
-                columns_payload.append(
-                    {
-                        "column_name": col.column_name,
-                        "column_datatype": col.column_datatype,
-                        "column_values": col.column_values[:5] if col.column_values else [],
-                    }
-                )
-            columns_text = f" columns: {columns_payload}"
-            if columns_only:
-                full_name = self.table_name if dialect == DBType.SQLITE else self.identifier
-                return f"{full_name}: {self.table_type.upper()} {columns_text}"
-
         schema_text = " ".join(self.definition.split())
         # TODO: improve the schema compact for all databases
         schema_text = schema_text.replace("VARCHAR(16777216)", "VARCHAR")
         # schema_text = schema_text.replace('NUMBER(38,0)', 'NUMBER')
         # schema_text = schema_text.replace('create or replace TABLE', 'TABLE')
         full_name = self.table_name if dialect == DBType.SQLITE else self.identifier
-        return f"{full_name}: {schema_text}{columns_text}"
+        return f"{full_name}: {schema_text}"
 
     @classmethod
     def list_to_prompt(cls, schemas: List[TableSchema], dialect: str = "snowflake") -> str:
@@ -190,7 +138,6 @@ class TableSchema(BaseTableSchema):
             schema_name=data.get("schema_name", ""),
             definition=data["definition"],
             table_type=data.get("table_type", "table"),
-            columns=_load_columns(data.get("columns")),
         )
 
     @classmethod
@@ -206,7 +153,6 @@ class TableSchema(BaseTableSchema):
                     schema_name=table["schema_name"][index].as_py(),
                     definition=table["definition"][index].as_py(),
                     table_type=table["table_type"][index].as_py(),
-                    columns=_load_columns(table["columns"][index].as_py()) if "columns" in table.column_names else None,
                 )
             )
         return result
@@ -227,7 +173,6 @@ class TableValue(BaseTableSchema):
         max_value_length: int = 500,
         max_text_mark_length: int = 16,
         processed_schemas: str = "",
-        columns: Optional[List[ColumnMetadata]] = None,
     ) -> str:
         """
         Convert table values to a concise string representation for LLM prompt.
@@ -236,15 +181,10 @@ class TableValue(BaseTableSchema):
 
         values_str = str(self.table_values)
 
-        # Prefer structured columns metadata for masking long text columns
-        table_schema = {}
-        if columns:
-            table_schema = {col.column_name: col.column_datatype.upper() for col in columns}
-        elif processed_schemas and dialect == DBType.SQLITE:
+        if processed_schemas and dialect == DBType.SQLITE:
             table_schema = self._parse_table_schema(processed_schemas)
-
-        if table_schema:
-            values_str = self._process_text_columns(values_str, max_text_mark_length, table_schema)
+            if table_schema:
+                values_str = self._process_text_columns(values_str, max_text_mark_length, table_schema)
 
         if len(values_str) > max_value_length:
             logger.warning("table value is too long, truncating to %s characters" % max_value_length)
