@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from textwrap import dedent, indent
-from typing import List, Sequence
+from typing import List
 
 from sqlglot import parse_one
 from sqlglot.errors import SqlglotError
@@ -120,7 +120,6 @@ created_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
 updated_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
 PRIMARY KEY (view_id)
 """,
-        distribution=("view_id",),
     ),
     TableDefinition(
         name="dw_node",
@@ -139,7 +138,6 @@ created_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
 updated_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
 PRIMARY KEY (node_id),
 """,
-        distribution=("node_id",),
     ),
     TableDefinition(
         name="dw_node_relation",
@@ -152,7 +150,6 @@ created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
 updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
 PRIMARY KEY (from_node_id, to_node_id, relation_type)
 """,
-        distribution=("from_node_id", "to_node_id", "relation_type"),
     ),
     TableDefinition(
         name="std_field",
@@ -172,7 +169,6 @@ created_at         DATETIME DEFAULT CURRENT_TIMESTAMP,
 updated_at         DATETIME DEFAULT CURRENT_TIMESTAMP,
 PRIMARY KEY (std_field_id),
 """,
-        distribution=("std_field_id",),
     ),
     TableDefinition(
         name="std_field_mapping",
@@ -195,7 +191,6 @@ created_at            DATETIME DEFAULT CURRENT_TIMESTAMP,
 updated_at            DATETIME DEFAULT CURRENT_TIMESTAMP,
 PRIMARY KEY (mapping_id)
 """,
-        distribution=("mapping_id",),
     ),
     TableDefinition(
         name="dw_model",
@@ -220,7 +215,6 @@ created_at           DATETIME DEFAULT CURRENT_TIMESTAMP,
 updated_at           DATETIME DEFAULT CURRENT_TIMESTAMP,
 PRIMARY KEY (model_id),
 """,
-        distribution=("model_id",),
     ),
     TableDefinition(
         name="dw_model_column",
@@ -240,7 +234,6 @@ created_at         DATETIME DEFAULT CURRENT_TIMESTAMP,
 updated_at         DATETIME DEFAULT CURRENT_TIMESTAMP,
 PRIMARY KEY (model_id, column_name)
 """,
-        distribution=("model_id", "column_name"),
     ),
     TableDefinition(
         name="ai_view_feature",
@@ -250,7 +243,6 @@ feature_json STRING NOT NULL COMMENT 'sqlglot 抽取的特征 JSON',
 analyzed_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
 PRIMARY KEY (view_id)
 """,
-        distribution=("view_id",),
     ),
     TableDefinition(
         name="ai_feedback",
@@ -266,7 +258,6 @@ created_by      VARCHAR(64) NULL,
 created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
 PRIMARY KEY (feedback_id)
 """,
-        distribution=("feedback_id",),
     ),
     TableDefinition(
         name="ai_rule",
@@ -281,7 +272,6 @@ created_from_feedback_ids STRING NULL,
 created_at                DATETIME DEFAULT CURRENT_TIMESTAMP,
 PRIMARY KEY (rule_id)
 """,
-        distribution=("rule_id",),
     ),
 )
 
