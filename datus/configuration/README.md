@@ -77,7 +77,24 @@ Configure database connections by namespace:
       path_pattern: ~/benchmark/bird/dev_20240627/dev_databases/**/*.sqlite # fuzzy matching, just support glob pattern
 ```
 
-### 4. Storage Configuration
+### 4. Source Database Configuration
+
+Define upstream/source systems that the agent can connect to outside of the active namespace. Each entry behaves like a standalone connection profile and can be referenced programmatically:
+
+```yaml
+  sourcedb:
+    reporting_mysql:
+      type: mysql
+      host: ${MYSQL_HOST}
+      port: ${MYSQL_PORT}
+      username: ${MYSQL_USERNAME}
+      password: ${MYSQL_PASSWORD}
+      database: reporting
+```
+
+Use `agent_config.source_db_config("reporting_mysql")` to access these connection details at runtime.
+
+### 5. Storage Configuration
 
 Configure vector storage for RAG functionality:
 
@@ -93,7 +110,7 @@ Configure vector storage for RAG functionality:
       target_model: openai # the openai config
 ```
 
-### 5. Workflow Plans
+### 6. Workflow Plans
 
 Define execution workflows:
 

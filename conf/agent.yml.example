@@ -135,6 +135,15 @@ agent:
       password: ${STARROCKS_PASSWORD}
       database: ${STARROCKS_DATABASE}
 
+  sourcedb:
+    reporting_mysql:
+      type: mysql
+      host: ${MYSQL_HOST}
+      port: ${MYSQL_PORT}
+      username: ${MYSQL_USERNAME}
+      password: ${MYSQL_PASSWORD}
+      database: ${MYSQL_DATABASE}
+
   metrics:
     duckdb:
       domain: sale

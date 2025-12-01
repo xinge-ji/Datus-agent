@@ -256,6 +256,8 @@ class AgentConfig:
                 self.custom_workflows[k] = v
         self.namespaces: Dict[str, Dict[str, DbConfig]] = {}
         self._init_namespace_config(kwargs.get("namespace", {}))
+        self.source_databases: Dict[str, DbConfig] = {}
+        self._init_sourcedb_config(kwargs.get("sourcedb", {}))
 
         self.metric_meta = {k: MetricMeta.filter_kwargs(MetricMeta, v) for k, v in kwargs.get("metrics", {}).items()}
         self.workspace_root = None
@@ -392,6 +394,36 @@ class AgentConfig:
         self,
     ) -> Dict[str, DbConfig]:
         return self.namespaces[self._current_namespace]
+
+    def _init_sourcedb_config(self, sourcedb_config: Dict[str, Any]):
+        if not isinstance(sourcedb_config, dict):
+            return
+        for source_name, db_config_dict in sourcedb_config.items():
+            if not isinstance(db_config_dict, dict):
+                logger.warning(
+                    "Skip invalid sourcedb config for %s, expected mapping but got %s",
+                    source_name,
+                    type(db_config_dict).__name__,
+                )
+                continue
+            normalized_config = {"name": db_config_dict.get("name", source_name), **db_config_dict}
+            self.source_databases[source_name] = DbConfig.filter_kwargs(DbConfig, normalized_config)
+
+    def source_db_config(self, name: str) -> DbConfig:
+        if not name:
+            raise DatusException(
+                code=ErrorCode.COMMON_FIELD_REQUIRED,
+                message_args={"field_name": "sourcedb"},
+            )
+        if name not in self.source_databases:
+            raise DatusException(
+                code=ErrorCode.COMMON_UNSUPPORTED,
+                message_args={"field_name": "sourcedb", "your_value": name},
+            )
+        return self.source_databases[name]
+
+    def source_db_configs(self) -> Dict[str, DbConfig]:
+        return self.source_databases
 
     def current_metric_meta(self, metric_meta_name: str = "") -> MetricMeta:
         if not metric_meta_name:

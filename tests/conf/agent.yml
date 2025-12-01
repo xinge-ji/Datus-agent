@@ -137,6 +137,15 @@ agent:
       password: ${STARROCKS_PASSWORD}
       database: ${STARROCKS_DATABASE}
 
+  sourcedb:
+    reporting_mysql:
+      type: mysql
+      host: localhost
+      port: 3306
+      username: reporter
+      password: reporter_pass
+      database: reporting
+
   storage:
     base_path: data
     embedding_device_type: cpu

@@ -128,3 +128,14 @@ def test_get_db_name_type(agent_config: AgentConfig):
     db_name, db_type = agent_config.current_db_name_type(db_name="ssb")
     assert db_name == "ssb"
     assert db_type == DBType.STARROCKS
+
+
+def test_sourcedb_configuration():
+    agent_config = load_agent_config(config="tests/conf/agent.yml", reload=True)
+    reporting_db = agent_config.source_db_config("reporting_mysql")
+    assert reporting_db.type == "mysql"
+    assert reporting_db.host == "localhost"
+    assert agent_config.source_db_configs()["reporting_mysql"].database == "reporting"
+
+    with pytest.raises(DatusException, match="sourcedb"):
+        agent_config.source_db_config("missing")

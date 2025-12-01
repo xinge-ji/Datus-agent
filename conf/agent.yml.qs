@@ -38,6 +38,15 @@ agent:
       name: california_schools
       uri: ~/.datus/benchmark/california_schools/california_schools.sqlite
 
+  sourcedb:
+    warehouse_mysql:
+      type: mysql
+      host: ${MYSQL_HOST}
+      port: ${MYSQL_PORT}
+      username: ${MYSQL_USERNAME}
+      password: ${MYSQL_PASSWORD}
+      database: ${MYSQL_DATABASE}
+
   nodes:
     schema_linking:
       matching_rate: fast
