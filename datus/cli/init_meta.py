@@ -13,7 +13,7 @@ from textwrap import dedent, indent
 from typing import List, Sequence
 
 from sqlglot import parse_one
-from sqlglot.errors import Error as SqlglotError
+from sqlglot.errors import SqlglotError
 
 from datus.configuration.agent_config import AgentConfig
 from datus.configuration.agent_config_loader import load_agent_config
