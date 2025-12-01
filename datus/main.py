@@ -20,6 +20,7 @@ if __package__ is None:
 
 from datus import __version__
 from datus.agent.agent import Agent
+from datus.cli.init_meta import SqlMeshMetaInitializer
 from datus.cli.interactive_init import InteractiveInit
 from datus.configuration.agent_config_loader import load_agent_config
 from datus.schemas.node_models import SqlTask
@@ -59,6 +60,26 @@ def create_parser() -> argparse.ArgumentParser:
         help="Interactive setup wizard for basic configuration",
         parents=[global_parser],
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    # init-meta command
+    init_meta_parser = subparsers.add_parser(
+        "init-meta",
+        help="Create dw_meta metadata tables inside the database referenced by a namespace",
+        parents=[global_parser],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    init_meta_parser.add_argument(
+        "--namespace",
+        type=str,
+        required=True,
+        help="Namespace mapped to the target SQL database",
+    )
+    init_meta_parser.add_argument(
+        "--database",
+        type=str,
+        default="",
+        help="Logical database name inside the namespace (required when multiple are configured)",
     )
 
     # namespace command
@@ -363,6 +384,15 @@ def main():
         configure_logging(args.debug, console_output=False)
         init = InteractiveInit()
         return init.run()
+
+    if args.action == "init-meta":
+        configure_logging(args.debug, console_output=False)
+        initializer = SqlMeshMetaInitializer(
+            namespace=args.namespace,
+            config_path=args.config or "",
+            database=getattr(args, "database", "") or "",
+        )
+        return initializer.run()
 
     if args.action == "tutorial":
         configure_logging(args.debug, console_output=False)

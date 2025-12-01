@@ -1,7 +1,7 @@
 # Copyright 2025-present DatusAI, Inc.
 # Licensed under the Apache License, Version 2.0.
 # See http://www.apache.org/licenses/LICENSE-2.0 for details.
-import os.path
+import os
 from typing import Any, List, Optional, Union
 
 import numpy as np
@@ -191,6 +191,8 @@ def check_snapshot(model_name: str, cache_dir: str) -> None:
     from huggingface_hub.utils import disable_progress_bars
 
     disable_progress_bars()
+    
+    os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
     try:
         snapshot_download(repo_id, cache_dir=cache_dir, local_files_only=True)
