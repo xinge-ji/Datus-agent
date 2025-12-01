@@ -26,10 +26,10 @@ logger = get_logger(__name__)
 DEFAULT_BUCKETS = 10
 DEFAULT_PROPERTIES = dedent(
     """\
-"replication_allocation" = "tag.location.default: 1",
-"light_schema_change" = "true",
-"disable_auto_compaction" = "false",
-"storage_format" = "V2"
+"replication_allocation" = "tag.location.default: 3",
+"in_memory" = "false",
+"storage_format" = "V2",
+"disable_auto_compaction" = "false"
 """
 ).strip()
 
@@ -56,23 +56,54 @@ SQLGLOT_DIALECT_MAP = {
 class TableDefinition:
     name: str
     columns: str
-    distribution: Sequence[str]
     buckets: int = DEFAULT_BUCKETS
 
-    def doris_template(self) -> str:
-        column_sql = indent(dedent(self.columns).strip(), "    ")
-        distribution = ", ".join(self.distribution)
+    def _primary_key_columns(self) -> List[str]:
+        raw_lines = [line.strip().rstrip(",") for line in dedent(self.columns).splitlines() if line.strip()]
+        for line in raw_lines:
+            upper = line.upper()
+            if upper.startswith("PRIMARY KEY"):
+                start = line.find("(")
+                end = line.rfind(")")
+                if start != -1 and end != -1 and end > start:
+                    cols_segment = line[start + 1 : end]
+                    cols = [col.strip(" `") for col in cols_segment.split(",") if col.strip()]
+                    if cols:
+                        return cols
+        return []
+
+    def _clean_columns(self) -> List[str]:
+        raw_lines = [line.strip() for line in dedent(self.columns).splitlines() if line.strip()]
+        filtered: List[str] = [
+            line for line in raw_lines if not line.upper().startswith(("PRIMARY KEY", "UNIQUE KEY"))
+        ]
+        if filtered and filtered[-1].endswith(","):
+            filtered[-1] = filtered[-1].rstrip(",")
+        return filtered
+
+    def _unique_key_column(self) -> str:
+        pk_cols = self._primary_key_columns()
+        if pk_cols:
+            return ", ".join(pk_cols)
+        cleaned = self._clean_columns()
+        if not cleaned:
+            raise ValueError(f"表 {self.name} 缺少字段定义，无法生成 UNIQUE KEY")
+        return cleaned[0].split()[0]
+
+    def doris_statements(self) -> List[str]:
+        clean_columns = self._clean_columns()
+        unique_key = self._unique_key_column()
+        column_sql = indent("\n".join(clean_columns), "    ")
         properties = indent(DEFAULT_PROPERTIES, "    ")
-        return (
-            f"CREATE TABLE IF NOT EXISTS dw_meta.{self.name} (\n"
+        drop_stmt = f"DROP TABLE IF EXISTS dw_meta.{self.name};"
+        create_stmt = (
+            f"CREATE TABLE dw_meta.{self.name} (\n"
             f"{column_sql}\n"
-            ")\n"
-            "ENGINE=OLAP\n"
-            f"DISTRIBUTED BY HASH({distribution}) BUCKETS {self.buckets}\n"
-            "PROPERTIES (\n"
+            f") UNIQUE KEY ({unique_key}) DISTRIBUTED BY HASH ({unique_key}) BUCKETS {self.buckets} PROPERTIES (\n"
             f"{properties}\n"
             ");"
         )
+        return [drop_stmt, create_stmt]
 
 
 DW_META_TABLES: tuple[TableDefinition, ...] = (
@@ -107,7 +138,6 @@ remark            STRING NULL,
 created_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
 updated_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
 PRIMARY KEY (node_id),
-UNIQUE KEY uk_node (node_type, db_name, table_name)
 """,
         distribution=("node_id",),
     ),
@@ -141,7 +171,6 @@ is_active          TINYINT DEFAULT 1,
 created_at         DATETIME DEFAULT CURRENT_TIMESTAMP,
 updated_at         DATETIME DEFAULT CURRENT_TIMESTAMP,
 PRIMARY KEY (std_field_id),
-UNIQUE KEY uk_std_name (std_field_name)
 """,
         distribution=("std_field_id",),
     ),
@@ -190,7 +219,6 @@ status               VARCHAR(16) DEFAULT 'DRAFT' COMMENT 'DRAFT/ACTIVE/DEPRECATE
 created_at           DATETIME DEFAULT CURRENT_TIMESTAMP,
 updated_at           DATETIME DEFAULT CURRENT_TIMESTAMP,
 PRIMARY KEY (model_id),
-UNIQUE KEY uk_model (db_name, table_name)
 """,
         distribution=("model_id",),
     ),
@@ -262,13 +290,13 @@ def _base_statements() -> List[str]:
     statements = [
         dedent(
             """\
-CREATE DATABASE IF NOT EXISTS dw_meta
-COMMENT 'Metadata repository managed by Datus Agent';
+CREATE DATABASE IF NOT EXISTS dw_meta;
 """
         ).strip(),
-        "USE dw_meta",
+        "USE dw_meta;",
     ]
-    statements.extend(table.doris_template() for table in DW_META_TABLES)
+    for table in DW_META_TABLES:
+        statements.extend(table.doris_statements())
     return statements
 
 
@@ -279,12 +307,18 @@ def _normalize_dialect(db_type: str) -> str:
 
 def compile_dw_meta_statements(target_dialect: str) -> List[str]:
     statements: List[str] = []
-    for raw_sql in _base_statements():
+    try:
+        base_statements = _base_statements()
+    except ValueError as exc:
+        raise RuntimeError(f"生成 dw_meta DDL 失败: {exc}") from exc
+
+    for raw_sql in base_statements:
         try:
             expr = parse_one(raw_sql, read="doris")
         except SqlglotError as exc:  # pragma: no cover - parse errors handled upstream
             raise RuntimeError(f"Failed to parse Doris DDL: {exc}") from exc
         statements.append(expr.sql(dialect=target_dialect))
+        logger.debug("编译 SQL 成功（方言=%s）: %s", target_dialect, statements[-1])
     return statements
 
 
@@ -326,7 +360,10 @@ class SqlMeshMetaInitializer:
             logger.error(f"Failed to compile dw_meta schema for dialect '{dialect}': {exc}")
             return 1
 
+        logger.info("准备在命名空间 '%s' 的数据库 '%s' 执行 %d 条建表语句，方言=%s", self.namespace, logic_db, len(statements), dialect)
+
         for statement in statements:
+            logger.debug("执行SQL: %s", statement)
             result = connector.execute({"sql_query": statement})
             if not result.success or result.error:
                 error_msg = result.error or "Unknown error"

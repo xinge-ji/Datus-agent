@@ -190,7 +190,7 @@ def check_snapshot(model_name: str, cache_dir: str) -> None:
     from huggingface_hub import snapshot_download
     from huggingface_hub.utils import disable_progress_bars
 
-    disable_progress_bars()
+    # disable_progress_bars()
     
     os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
