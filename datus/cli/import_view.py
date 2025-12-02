@@ -137,7 +137,12 @@ class ImportViewRunner:
     def _load_views(self) -> List[Dict[str, str]]:
         views = []
         if hasattr(self.source_conn, "get_views_with_ddl"):
-            views = self.source_conn.get_views_with_ddl()
+            db_name = getattr(self.source_conn, "database_name", "") or self.sourcedb
+            schema_name = getattr(self.source_conn, "schema_name", "")
+            try:
+                views = self.source_conn.get_views_with_ddl(database_name=db_name, schema_name=schema_name)
+            except TypeError:
+                views = self.source_conn.get_views_with_ddl()
         else:
             logger.warning("连接器不支持 get_views_with_ddl，无法导入视图")
         return views
@@ -145,8 +150,10 @@ class ImportViewRunner:
     def _load_tables(self) -> List[Dict[str, str]]:
         tables = []
         if hasattr(self.source_conn, "get_tables_with_ddl"):
+            db_name = getattr(self.source_conn, "database_name", "") or self.sourcedb
+            schema_name = getattr(self.source_conn, "schema_name", "")
             try:
-                tables = self.source_conn.get_tables_with_ddl()
+                tables = self.source_conn.get_tables_with_ddl(database_name=db_name, schema_name=schema_name)
             except Exception as exc:
                 logger.warning("获取表 DDL 失败: %s", exc)
         return tables
