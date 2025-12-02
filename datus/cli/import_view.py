@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import sys
 from dataclasses import dataclass
 from datetime import datetime
+from io import StringIO
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from datus.configuration.agent_config import AgentConfig
@@ -142,7 +144,7 @@ class ImportViewRunner:
             f"WHERE source_system = '{self.sourcedb}'"
         )
         result = self.meta_conn.execute({"sql_query": sql, "result_format": "list"})
-        rows = result.sql_return if result and result.success else []
+        rows = self._rows_from_result(result)
         existing: Dict[str, ViewSourceRow] = {}
         for row in rows:
             key = str(row.get("view_name", "")).lower()
@@ -174,8 +176,9 @@ class ImportViewRunner:
             "ORDER BY view_id DESC LIMIT 1"
         )
         res = self.meta_conn.execute({"sql_query": fetch_sql, "result_format": "list"})
-        if res and res.success and res.sql_return:
-            return int(res.sql_return[0].get("view_id"))
+        rows = self._rows_from_result(res)
+        if rows:
+            return int(rows[0].get("view_id"))
         raise RuntimeError(f"无法获取 view_id: {row.view_name}")
 
     def _cleanup_downstream(self, view_names: List[str]):
@@ -187,7 +190,7 @@ class ImportViewRunner:
             f"WHERE source_system = '{self.sourcedb}' AND view_name IN ({names_sql})"
         )
         res = self.meta_conn.execute({"sql_query": view_ids_sql, "result_format": "list"})
-        view_ids = [str(r.get("view_id")) for r in (res.sql_return if res and res.success else []) if r.get("view_id")]
+        view_ids = [str(r.get("view_id")) for r in self._rows_from_result(res) if r.get("view_id")]
         if not view_ids:
             return
         id_list = ",".join(view_ids)
@@ -220,9 +223,10 @@ class ImportViewRunner:
             "ORDER BY node_id DESC LIMIT 1"
         )
         res = self.meta_conn.execute({"sql_query": sql, "result_format": "list"})
-        if not res or not res.success or not res.sql_return:
+        rows = self._rows_from_result(res)
+        if not rows:
             return False
-        status = (res.sql_return[0].get("migration_status") or "").upper()
+        status = (rows[0].get("migration_status") or "").upper()
         return status in {"REVIEWED", "IMPLEMENTED", "SKIPPED"}
 
     # ---------- DAG ---------- #
@@ -289,8 +293,9 @@ class ImportViewRunner:
         fetch = self.meta_conn.execute(
             {"sql_query": f"SELECT node_id FROM dw_meta.dw_node WHERE source_view_id = {view_id} LIMIT 1"}
         )
-        if fetch and fetch.success and fetch.sql_return:
-            return int(fetch.sql_return[0].get("node_id"))
+        rows = self._rows_from_result(fetch)
+        if rows:
+            return int(rows[0].get("node_id"))
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         view_name_esc = self._escape(view_name)
         db_name_esc = self._escape(db_name)
@@ -321,22 +326,23 @@ class ImportViewRunner:
             parsed = parse_table_name_parts(table_name, dialect=DBType.ORACLE)
             table_db = self._escape(parsed.get("database_name") or db_name)
             table_nm = self._escape(parsed.get("table_name") or "")
-            fetch = self.meta_conn.execute(
-                {
-                    "sql_query": (
-                        "SELECT node_id FROM dw_meta.dw_node "
-                        f"WHERE db_name = '{table_db}' AND table_name = '{table_nm}' LIMIT 1"
-                    )
-                }
-            )
-            node_id = None
-            if fetch and fetch.success and fetch.sql_return:
-                node_id = int(fetch.sql_return[0].get("node_id"))
-            else:
-                now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-                insert = (
-                    "INSERT INTO dw_meta.dw_node "
-                    "(node_type, db_name, table_name, migration_status, created_at, updated_at) "
+        fetch = self.meta_conn.execute(
+            {
+                "sql_query": (
+                    "SELECT node_id FROM dw_meta.dw_node "
+                    f"WHERE db_name = '{table_db}' AND table_name = '{table_nm}' LIMIT 1"
+                )
+            }
+        )
+        node_id = None
+        rows = self._rows_from_result(fetch)
+        if rows:
+            node_id = int(rows[0].get("node_id"))
+        else:
+            now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            insert = (
+                "INSERT INTO dw_meta.dw_node "
+                "(node_type, db_name, table_name, migration_status, created_at, updated_at) "
                     f"VALUES ('ODS_TABLE', '{table_db}', '{table_nm}', 'NEW', '{now}', '{now}')"
                 )
                 self.meta_conn.execute({"sql_query": insert})
@@ -349,10 +355,11 @@ class ImportViewRunner:
                         )
                     }
                 )
-                if res and res.success and res.sql_return:
-                    node_id = int(res.sql_return[0].get("node_id"))
-            if node_id is not None:
-                nodes[alias] = node_id
+                rows2 = self._rows_from_result(res)
+                if rows2:
+                    node_id = int(rows2[0].get("node_id"))
+        if node_id is not None:
+            nodes[alias] = node_id
         return nodes
 
     def _upsert_relations(
@@ -461,8 +468,9 @@ class ImportViewRunner:
                 )
             }
         )
-        if fetch and fetch.success and fetch.sql_return:
-            return int(fetch.sql_return[0].get("std_field_id"))
+        rows = self._rows_from_result(fetch)
+        if rows:
+            return int(rows[0].get("std_field_id"))
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         std_name = self._escape(item["std_field_name"])
         std_name_cn = self._escape(item["std_field_name_cn"])
@@ -482,8 +490,9 @@ class ImportViewRunner:
                 )
             }
         )
-        if res and res.success and res.sql_return:
-            return int(res.sql_return[0].get("std_field_id"))
+        rows2 = self._rows_from_result(res)
+        if rows2:
+            return int(rows2[0].get("std_field_id"))
         raise RuntimeError(f"无法获取 std_field_id: {item['std_field_name']}")
 
     def _upsert_std_mapping(self, std_field_id: int, item: Dict[str, str]):
@@ -538,6 +547,23 @@ class ImportViewRunner:
 
     def _escape(self, value: str) -> str:
         return (value or "").replace("'", "''")
+
+    def _rows_from_result(self, result: Any) -> List[Dict[str, Any]]:
+        """容错解析 ExecuteSQLResult，统一返回 list[dict]。"""
+        if not result or not getattr(result, "success", False):
+            return []
+        data = getattr(result, "sql_return", None)
+        if isinstance(data, list):
+            if data and isinstance(data[0], dict):
+                return data
+            return []
+        if isinstance(data, str):
+            try:
+                reader = csv.DictReader(StringIO(data))
+                return [dict(row) for row in reader if row]
+            except Exception:
+                return []
+        return []
 
 
 def run_import_view(agent_config: AgentConfig, db_manager: DBManager, args) -> Dict[str, Any]:
