@@ -39,8 +39,10 @@ class ImportViewRunner:
         self.namespace = namespace
         self.sourcedb = sourcedb
         self.strategy = strategy
+        # 源库连接：使用 sourcedb 逻辑名
         self.source_conn = self.db_manager.get_conn(namespace, sourcedb)
-        meta_logic_db = getattr(agent_config, "current_database", None) or sourcedb
+        # 元库连接：使用 namespace 默认/当前数据库（init-meta 所在）
+        meta_logic_db = getattr(agent_config, "current_database", None) or agent_config.current_database or ""
         self.meta_conn = self.db_manager.get_conn(namespace, meta_logic_db)
         self.ast = AstAnalyzer(dialect="oracle")
         self.llm: Optional[LLMBaseModel] = None
@@ -137,7 +139,7 @@ class ImportViewRunner:
     def _load_views(self) -> List[Dict[str, str]]:
         views = []
         if hasattr(self.source_conn, "get_views_with_ddl"):
-            db_name = getattr(self.source_conn, "database_name", "") or self.sourcedb
+            db_name = getattr(self.source_conn, "database_name", "") or getattr(self.source_conn, "schema_name", "") or ""
             schema_name = getattr(self.source_conn, "schema_name", "")
             try:
                 views = self.source_conn.get_views_with_ddl(database_name=db_name, schema_name=schema_name)
@@ -150,7 +152,7 @@ class ImportViewRunner:
     def _load_tables(self) -> List[Dict[str, str]]:
         tables = []
         if hasattr(self.source_conn, "get_tables_with_ddl"):
-            db_name = getattr(self.source_conn, "database_name", "") or self.sourcedb
+            db_name = getattr(self.source_conn, "database_name", "") or getattr(self.source_conn, "schema_name", "") or ""
             schema_name = getattr(self.source_conn, "schema_name", "")
             try:
                 tables = self.source_conn.get_tables_with_ddl(database_name=db_name, schema_name=schema_name)
