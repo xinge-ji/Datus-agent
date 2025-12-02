@@ -40,25 +40,21 @@ class ImportViewRunner:
         self.sourcedb = sourcedb
         self.strategy = strategy
         self.source_conn = self.db_manager.get_conn(namespace, sourcedb)
-        # 元数据写 dw_meta，使用当前 database 连接即可，SQL 中全量限定 dw_meta.*
         meta_logic_db = getattr(agent_config, "current_database", None) or sourcedb
         self.meta_conn = self.db_manager.get_conn(namespace, meta_logic_db)
         self.ast = AstAnalyzer(dialect="oracle")
         self.llm: Optional[LLMBaseModel] = None
 
-    # ---------- 对外入口 ---------- #
     def run(self) -> Dict[str, Any]:
         """执行全流程，返回简单统计。"""
         all_tables = self._load_tables()
         all_views = self._load_views()
         table_existing = self._load_existing_table_source(table_type="TABLE")
-        view_table_existing = self._load_existing_table_source(table_type="VIEW")
-        existing = self._load_existing_view_source()
+        view_existing = self._load_existing_view_source()
 
         if self.strategy == "overwrite":
-            self._cleanup_downstream(list(existing.keys()))
+            self._cleanup_downstream(list(view_existing.keys()))
 
-        # 1) 计算 hash & 决定待处理队列
         to_process: List[ViewSourceRow] = []
         reused_views: List[ViewSourceRow] = []
         new_view_ids: List[int] = []
@@ -67,15 +63,22 @@ class ImportViewRunner:
         for tbl in all_tables:
             row = self._normalize_view(tbl)
             key = row.view_name.lower()
-            self._upsert_table_source(row, table_existing.get(key), table_type="TABLE")
+            table_id = self._upsert_table_source(row, table_existing.get(key), table_type="TABLE")
+            row.view_id = table_id
+            table_existing[key] = row
 
+        # 处理视图
         for view_meta in all_views:
             row = self._normalize_view(view_meta)
             key = row.view_name.lower()
-            self._upsert_table_source(row, view_table_existing.get(key), table_type="VIEW")
-            latest = existing.get(key)
+            new_table_id = self._upsert_table_source(row, view_existing.get(key), table_type="VIEW")
+            if new_table_id:
+                row.view_id = new_table_id
+                view_existing[key] = row
+            latest = view_existing.get(key)
+            if latest and not row.view_id:
+                row.view_id = latest.view_id
             if self.strategy == "incremental" and latest and latest.sql_hash == row.sql_hash:
-                # 未变更，检查 dw_node 状态
                 if self._can_skip(latest.view_id):
                     reused_views.append(latest)
                     continue
@@ -83,18 +86,18 @@ class ImportViewRunner:
                 to_process.append(latest)
                 continue
 
-            # 变更或 overwrite，插入新 view_source
-            new_id = self._insert_view_source(row)
-            row.view_id = new_id
+            if not row.view_id:
+                row.view_id = latest.view_id if latest else 0
             to_process.append(row)
-            new_view_ids.append(new_id)
+            if row.view_id:
+                new_view_ids.append(row.view_id)
 
-        # 2) DAG 排序（仅视图间依赖）
+        # DAG 排序（仅视图间依赖）
         view_name_set = {v.view_name.lower() for v in to_process + reused_views}
         dep_graph, table_deps = self._build_dependency_graph(to_process + reused_views, view_name_set)
         topo = self._topo_sort(dep_graph)
 
-        # 3) AST 分析 + 落表
+        # AST 分析 + 落表
         processed, failed = 0, 0
         for view_name in topo:
             row = self._find_row(view_name, to_process + reused_views)
@@ -117,7 +120,7 @@ class ImportViewRunner:
                 std_items = self._prepare_std_items(feature, alias_map, row.view_name, row.db_name)
                 self._persist_std_and_feedback(row.view_name, row.db_name, std_items)
                 processed += 1
-            except Exception as exc:  # pragma: no cover - 运行时错误写入 feature
+            except Exception as exc:  # pragma: no cover
                 logger.error("视图解析失败 %s: %s", row.view_name, exc)
                 error_json = json.dumps({"status": "ERROR", "error": str(exc)}, ensure_ascii=True)
                 self._upsert_ai_view_feature(row.view_id, error_json)
@@ -132,7 +135,6 @@ class ImportViewRunner:
 
     # ---------- 视图与 hash ---------- #
     def _load_views(self) -> List[Dict[str, str]]:
-        """从源库读取视图 DDL。"""
         views = []
         if hasattr(self.source_conn, "get_views_with_ddl"):
             views = self.source_conn.get_views_with_ddl()
@@ -141,7 +143,6 @@ class ImportViewRunner:
         return views
 
     def _load_tables(self) -> List[Dict[str, str]]:
-        """从源库读取表 DDL（若支持）。"""
         tables = []
         if hasattr(self.source_conn, "get_tables_with_ddl"):
             try:
@@ -165,9 +166,9 @@ class ImportViewRunner:
 
     def _load_existing_view_source(self) -> Dict[str, ViewSourceRow]:
         sql = (
-            "SELECT view_id, view_name, db_name, ddl_sql, hash "
-            "FROM dw_meta.view_source "
-            f"WHERE source_system = '{self.sourcedb}'"
+            "SELECT table_id as view_id, table_name as view_name, '' as db_name, ddl_sql, hash "
+            "FROM dw_meta.table_source "
+            f"WHERE source_system = '{self.sourcedb}' AND table_type = 'VIEW'"
         )
         result = self.meta_conn.execute({"sql_query": sql, "result_format": "list"})
         rows = self._rows_from_result(result)
@@ -177,7 +178,7 @@ class ImportViewRunner:
             existing[key] = ViewSourceRow(
                 view_id=row.get("view_id"),
                 view_name=row.get("view_name", ""),
-                db_name=row.get("db_name", ""),
+                db_name="",
                 ddl_sql=row.get("ddl_sql", ""),
                 sql_hash=row.get("hash", "") or "",
             )
@@ -203,34 +204,9 @@ class ImportViewRunner:
             )
         return existing
 
-    def _insert_view_source(self, row: ViewSourceRow) -> int:
-        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        view_name = self._escape(row.view_name)
-        db_name = self._escape(row.db_name)
-        ddl_sql = self._escape(row.ddl_sql)
-        sql_hash = self._escape(row.sql_hash)
-        sql = (
-            "INSERT INTO dw_meta.view_source "
-            "(source_system, view_name, db_name, ddl_sql, hash, created_at, updated_at) "
-            f"VALUES ('{self.sourcedb}', '{view_name}', '{db_name}', "
-            f"'{ddl_sql}', '{sql_hash}', '{now}', '{now}')"
-        )
-        self.meta_conn.execute({"sql_query": sql})
-        fetch_sql = (
-            "SELECT view_id FROM dw_meta.view_source "
-            f"WHERE source_system = '{self.sourcedb}' AND view_name = '{view_name}' "
-            "ORDER BY view_id DESC LIMIT 1"
-        )
-        res = self.meta_conn.execute({"sql_query": fetch_sql, "result_format": "list"})
-        rows = self._rows_from_result(res)
-        if rows:
-            return int(rows[0].get("view_id"))
-        raise RuntimeError(f"无法获取 view_id: {row.view_name}")
-
     def _upsert_table_source(
         self, row: ViewSourceRow, existing: Optional[ViewSourceRow], table_type: str = "VIEW"
     ) -> int:
-        """将定义同步到 table_source。返回 table_id。"""
         if existing and existing.sql_hash == row.sql_hash:
             return existing.view_id or 0
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
@@ -260,17 +236,15 @@ class ImportViewRunner:
             return
         names_sql = ",".join(f"'{self._escape(v)}'" for v in view_names)
         view_ids_sql = (
-            "SELECT view_id FROM dw_meta.view_source "
-            f"WHERE source_system = '{self.sourcedb}' AND view_name IN ({names_sql})"
+            "SELECT table_id as view_id FROM dw_meta.table_source "
+            f"WHERE source_system = '{self.sourcedb}' AND table_type = 'VIEW' AND table_name IN ({names_sql})"
         )
         res = self.meta_conn.execute({"sql_query": view_ids_sql, "result_format": "list"})
         view_ids = [str(r.get("view_id")) for r in self._rows_from_result(res) if r.get("view_id")]
         if not view_ids:
             return
         id_list = ",".join(view_ids)
-        # 清理 ai_view_feature
         self.meta_conn.execute({"sql_query": f"DELETE FROM dw_meta.ai_view_feature WHERE view_id IN ({id_list})"})
-        # 清理 mapping/节点/关系
         self.meta_conn.execute(
             {"sql_query": f"DELETE FROM dw_meta.std_field_mapping WHERE source_system = '{self.sourcedb}'"}
         )
@@ -340,7 +314,6 @@ class ImportViewRunner:
                     queue.append(dep)
         if len(order) < len(graph):
             logger.warning("检测到循环依赖，剩余未排序节点: %s", set(graph) - set(order))
-            # 将剩余节点按名称补上
             for k in graph:
                 if k not in order:
                     order.append(k)
@@ -440,11 +413,9 @@ class ImportViewRunner:
     def _upsert_relations(
         self, view_node_id: int, table_nodes: Dict[str, int], feature: Dict[str, Any], alias_map: Dict[str, Dict]
     ):
-        # 引用关系
         for alias, node_id in table_nodes.items():
             self._insert_relation(view_node_id, node_id, "VIEW_DEP", json.dumps({"alias": alias}))
 
-        # join 关系
         for join in feature.get("joins") or []:
             left_alias = join.get("left_alias") or ""
             right_alias = join.get("right_alias") or ""
@@ -507,7 +478,7 @@ class ImportViewRunner:
         if self.llm is None:
             try:
                 self.llm = LLMBaseModel.create_model(model_name="default", agent_config=self.agent_config)
-            except Exception as exc:  # pragma: no cover - 无网络情况下跳过
+            except Exception as exc:  # pragma: no cover
                 logger.warning("初始化 LLM 失败，改为人工确认模式: %s", exc)
                 self.llm = None
 
@@ -605,7 +576,6 @@ class ImportViewRunner:
             return ""
         return human or ""
 
-    # ---------- 工具 ---------- #
     def _to_snake(self, name: str) -> str:
         out = []
         prev_lower = False
@@ -624,7 +594,6 @@ class ImportViewRunner:
         return (value or "").replace("'", "''")
 
     def _rows_from_result(self, result: Any) -> List[Dict[str, Any]]:
-        """容错解析 ExecuteSQLResult，统一返回 list[dict]。"""
         if not result or not getattr(result, "success", False):
             return []
         data = getattr(result, "sql_return", None)
@@ -641,9 +610,6 @@ class ImportViewRunner:
         return []
 
     def _strip_create_view(self, ddl_sql: str) -> str:
-        """
-        剥离 CREATE VIEW 前缀，取 AS 后主体；若失败，返回原文。
-        """
         text = ddl_sql.strip().rstrip(";")
         pattern = re.compile(r"create\s+(or\s+replace\s+)?(force\s+)?view\s+.+?\bas\b", re.IGNORECASE | re.DOTALL)
         m = pattern.search(text)
@@ -652,9 +618,6 @@ class ImportViewRunner:
         return text
 
     def _strip_to_first_statement(self, ddl_sql: str) -> str:
-        """
-        找到首个 SELECT/WITH/INSERT 位置，截取后续语句，避免头部噪声。
-        """
         pattern = re.compile(r"\b(select|with|insert)\b", re.IGNORECASE)
         m = pattern.search(ddl_sql)
         if m:
@@ -662,9 +625,9 @@ class ImportViewRunner:
         return ddl_sql.strip()
 
     def _strip_ansi(self, text: str) -> str:
-        """去除 ANSI 控制符，避免 sqlglot 解析错误。"""
         ansi_re = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]", re.IGNORECASE)
         return ansi_re.sub("", text)
+
 
 def run_import_view(agent_config: AgentConfig, db_manager: DBManager, args) -> Dict[str, Any]:
     runner = ImportViewRunner(
