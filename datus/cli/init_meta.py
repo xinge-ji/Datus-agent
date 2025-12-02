@@ -74,9 +74,7 @@ class TableDefinition:
 
     def _clean_columns(self) -> List[str]:
         raw_lines = [line.strip() for line in dedent(self.columns).splitlines() if line.strip()]
-        filtered: List[str] = [
-            line for line in raw_lines if not line.upper().startswith(("PRIMARY KEY", "UNIQUE KEY"))
-        ]
+        filtered: List[str] = [line for line in raw_lines if not line.upper().startswith(("PRIMARY KEY", "UNIQUE KEY"))]
         if filtered and filtered[-1].endswith(","):
             filtered[-1] = filtered[-1].rstrip(",")
         return filtered
@@ -110,21 +108,21 @@ DW_META_TABLES: tuple[TableDefinition, ...] = (
     TableDefinition(
         name="view_source",
         columns="""
-view_id        BIGINT AUTO_INCREMENT,
+view_id        BIGINT NOT NULL AUTO_INCREMENT,
 source_system  VARCHAR(64) NOT NULL COMMENT 'ERP/CRM/..',
 view_name      VARCHAR(256) NOT NULL COMMENT '源视图名',
 db_name        VARCHAR(128) NOT NULL COMMENT '所在库名，如 erp',
 ddl_sql        STRING       NOT NULL COMMENT '视图定义SQL',
 hash           VARCHAR(64)  NULL COMMENT 'SQL hash，避免重复处理',
-created_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
-updated_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
+created_at     DATETIME,
+updated_at     DATETIME,
 PRIMARY KEY (view_id)
 """,
     ),
     TableDefinition(
         name="dw_node",
         columns="""
-node_id           BIGINT AUTO_INCREMENT,
+node_id           BIGINT NOT NULL AUTO_INCREMENT,
 node_type         VARCHAR(32) NOT NULL COMMENT 'ODS_TABLE/SRC_VIEW/DIM_TABLE/DWD_TABLE/DWS_TABLE',
 db_name           VARCHAR(128) NOT NULL,
 table_name        VARCHAR(256) NOT NULL,
@@ -134,8 +132,8 @@ ai_confidence     DECIMAL(5,4) NULL,
 human_layer_final VARCHAR(16) NULL COMMENT '人确认后的层级',
 migration_status  VARCHAR(32) DEFAULT 'NEW' COMMENT 'NEW/ANALYZED/PROPOSED/REVIEWED/IMPLEMENTED/SKIPPED',
 remark            STRING NULL,
-created_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
-updated_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
+created_at        DATETIME,
+updated_at        DATETIME,
 PRIMARY KEY (node_id),
 """,
     ),
@@ -146,15 +144,15 @@ from_node_id    BIGINT NOT NULL,
 to_node_id      BIGINT NOT NULL,
 relation_type   VARCHAR(32) NOT NULL COMMENT 'LINEAGE/JOIN/AGGREGATE/VIEW_DEP',
 relation_detail STRING NULL COMMENT '可存JSON: join条件/聚合维度等',
-created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
-updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+created_at      DATETIME,
+updated_at      DATETIME,
 PRIMARY KEY (from_node_id, to_node_id, relation_type)
 """,
     ),
     TableDefinition(
         name="std_field",
         columns="""
-std_field_id       BIGINT AUTO_INCREMENT,
+std_field_id       BIGINT NOT NULL AUTO_INCREMENT,
 std_field_name     VARCHAR(128) NOT NULL COMMENT 'snake_case，如 order_id',
 std_field_name_cn  VARCHAR(128) NOT NULL COMMENT '中文名',
 biz_domain_code    VARCHAR(64) NULL COMMENT '业务域，如 SALES',
@@ -165,15 +163,15 @@ description        STRING NULL,
 unit               VARCHAR(64) NULL,
 default_agg        VARCHAR(16) DEFAULT 'none',
 is_active          TINYINT DEFAULT 1,
-created_at         DATETIME DEFAULT CURRENT_TIMESTAMP,
-updated_at         DATETIME DEFAULT CURRENT_TIMESTAMP,
+created_at         DATETIME,
+updated_at         DATETIME,
 PRIMARY KEY (std_field_id),
 """,
     ),
     TableDefinition(
         name="std_field_mapping",
         columns="""
-mapping_id            BIGINT AUTO_INCREMENT,
+mapping_id            BIGINT NOT NULL AUTO_INCREMENT,
 source_system         VARCHAR(64) NOT NULL,
 source_db             VARCHAR(128) NOT NULL,
 source_table          VARCHAR(256) NOT NULL,
@@ -187,15 +185,15 @@ is_business_key       TINYINT DEFAULT 0,
 is_partition_key      TINYINT DEFAULT 0,
 is_active             TINYINT DEFAULT 1,
 remark                STRING NULL,
-created_at            DATETIME DEFAULT CURRENT_TIMESTAMP,
-updated_at            DATETIME DEFAULT CURRENT_TIMESTAMP,
+created_at            DATETIME,
+updated_at            DATETIME,
 PRIMARY KEY (mapping_id)
 """,
     ),
     TableDefinition(
         name="dw_model",
         columns="""
-model_id             BIGINT AUTO_INCREMENT,
+model_id             BIGINT NOT NULL AUTO_INCREMENT,
 model_name           VARCHAR(128) NOT NULL COMMENT '如 dwd_sales_detail',
 db_name              VARCHAR(128) NOT NULL COMMENT '如 dwd_erp',
 table_name           VARCHAR(128) NOT NULL COMMENT '物理表名，通常=模型名',
@@ -211,8 +209,8 @@ incremental_strategy VARCHAR(64)  NULL,
 default_filter       STRING NULL COMMENT '如 is_active = 1',
 source_view_id       BIGINT NULL COMMENT '原始视图ID',
 status               VARCHAR(16) DEFAULT 'DRAFT' COMMENT 'DRAFT/ACTIVE/DEPRECATED',
-created_at           DATETIME DEFAULT CURRENT_TIMESTAMP,
-updated_at           DATETIME DEFAULT CURRENT_TIMESTAMP,
+created_at           DATETIME,
+updated_at           DATETIME,
 PRIMARY KEY (model_id),
 """,
     ),
@@ -230,8 +228,8 @@ is_distributed_key TINYINT DEFAULT 0,
 not_null           TINYINT DEFAULT 0,
 comment            STRING NULL,
 is_active          TINYINT DEFAULT 1,
-created_at         DATETIME DEFAULT CURRENT_TIMESTAMP,
-updated_at         DATETIME DEFAULT CURRENT_TIMESTAMP,
+created_at         DATETIME,
+updated_at         DATETIME,
 PRIMARY KEY (model_id, column_name)
 """,
     ),
@@ -240,14 +238,14 @@ PRIMARY KEY (model_id, column_name)
         columns="""
 view_id      BIGINT NOT NULL,
 feature_json STRING NOT NULL COMMENT 'sqlglot 抽取的特征 JSON',
-analyzed_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+analyzed_at  DATETIME,
 PRIMARY KEY (view_id)
 """,
     ),
     TableDefinition(
         name="ai_feedback",
         columns="""
-feedback_id     BIGINT AUTO_INCREMENT,
+feedback_id     BIGINT NOT NULL AUTO_INCREMENT,
 object_type     VARCHAR(32) NOT NULL COMMENT 'VIEW/MODEL/COLUMN',
 object_key      VARCHAR(256) NOT NULL COMMENT '如 view:V_SA..., model:dwd_sales_detail, column:model_id:column_name',
 suggestion_type VARCHAR(64) NOT NULL COMMENT 'LAYER/PK/STD_FIELD/MODEL_NAME/...',
@@ -255,21 +253,21 @@ ai_value        STRING NULL,
 human_value     STRING NULL,
 context_feature STRING NULL,
 created_by      VARCHAR(64) NULL,
-created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+created_at      DATETIME,
 PRIMARY KEY (feedback_id)
 """,
     ),
     TableDefinition(
         name="ai_rule",
         columns="""
-rule_id                   BIGINT AUTO_INCREMENT,
+rule_id                   BIGINT NOT NULL AUTO_INCREMENT,
 rule_type                 VARCHAR(32) NOT NULL COMMENT 'VIEW_LAYER/STD_FIELD_MAPPING/NAME_PATTERN',
 pattern                   STRING NOT NULL COMMENT '匹配条件描述(文本/简单DSL)',
 action                    STRING NOT NULL COMMENT '执行动作描述，如 layer=DWD,biz_domain=SALES',
 weight                    INT DEFAULT 1,
 is_active                 TINYINT DEFAULT 1,
 created_from_feedback_ids STRING NULL,
-created_at                DATETIME DEFAULT CURRENT_TIMESTAMP,
+created_at                DATETIME,
 PRIMARY KEY (rule_id)
 """,
     ),
@@ -308,7 +306,7 @@ def compile_dw_meta_statements(target_dialect: str) -> List[str]:
         except SqlglotError as exc:  # pragma: no cover - parse errors handled upstream
             raise RuntimeError(f"Failed to parse Doris DDL: {exc}") from exc
         statements.append(expr.sql(dialect=target_dialect))
-        logger.debug("编译 SQL 成功（方言=%s）: %s", target_dialect, statements[-1])
+        logger.info("编译 SQL 成功（方言=%s）: %s", target_dialect, statements[-1])
     return statements
 
 
@@ -350,7 +348,13 @@ class SqlMeshMetaInitializer:
             logger.error(f"Failed to compile dw_meta schema for dialect '{dialect}': {exc}")
             return 1
 
-        logger.info("准备在命名空间 '%s' 的数据库 '%s' 执行 %d 条建表语句，方言=%s", self.namespace, logic_db, len(statements), dialect)
+        logger.info(
+            "准备在命名空间 '%s' 的数据库 '%s' 执行 %d 条建表语句，方言=%s",
+            self.namespace,
+            logic_db,
+            len(statements),
+            dialect,
+        )
 
         for statement in statements:
             logger.debug("执行SQL: %s", statement)

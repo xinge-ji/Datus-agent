@@ -236,6 +236,12 @@ class Agent:
             except Exception as exc:
                 logger.warning(f"Failed to refresh scoped KB for sub-agent '{name}': {exc}")
 
+    def import_view(self):
+        """导入视图并进行 DAG/AST 处理。"""
+        from datus.cli.import_view import run_import_view
+
+        return run_import_view(self.global_config, self.db_manager, self.args)
+
     def bootstrap_kb(self):
         """Initialize knowledge base storage components."""
         logger.info("Initializing knowledge base components")

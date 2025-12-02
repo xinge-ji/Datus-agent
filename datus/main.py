@@ -109,6 +109,23 @@ def create_parser() -> argparse.ArgumentParser:
     )
     check_db_parser.add_argument("--namespace", type=str, required=True, help="Database namespace to check")
 
+    # import-view command
+    import_view_parser = subparsers.add_parser(
+        "import-view",
+        help="导入源库视图并做 DAG/AST 分析",
+        parents=[global_parser],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    import_view_parser.add_argument("--namespace", type=str, required=True, help="命名空间")
+    import_view_parser.add_argument("--sourcedb", type=str, required=True, help="源库逻辑名")
+    import_view_parser.add_argument(
+        "--update_strategy",
+        type=str,
+        choices=["overwrite", "incremental"],
+        default="incremental",
+        help="更新策略：overwrite 全量重算，incremental 增量+重算 DAG/AST",
+    )
+
     # bootstrap-kb command
     bootstrap_parser = subparsers.add_parser(
         "bootstrap-kb",
@@ -386,7 +403,7 @@ def main():
         return init.run()
 
     if args.action == "init-meta":
-        configure_logging(args.debug, console_output=False)
+        configure_logging(args.debug, console_output=True)
         initializer = SqlMeshMetaInitializer(
             namespace=args.namespace,
             config_path=args.config or "",
@@ -416,6 +433,8 @@ def main():
     # Execute different functions based on action
     if args.action == "check-db":
         result = agent.check_db()
+    elif args.action == "import-view":
+        result = agent.import_view()
     elif args.action == "probe-llm":
         result = agent.probe_llm()
     elif args.action == "bootstrap-kb":
