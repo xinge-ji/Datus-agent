@@ -444,7 +444,7 @@ class ImportViewRunner:
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         view_name_esc = self._escape(view_name)
         db_name_esc = self._escape(db_name)
-        # 先按 source_table_id 查，兼容旧数据再按 source_system+table_name 查
+        # 仅按 source_table_id 或 source_system+table_name 识别视图节点，不再兼容 source_view_id
         fetch = self.meta_conn.execute(
             {
                 "sql_query": (
@@ -503,7 +503,8 @@ class ImportViewRunner:
         rows2 = self._rows_from_result(res)
         if rows2:
             return int(rows2[0].get("node_id"))
-        raise RuntimeError(f"无法获取 dw_node 节点: {view_name}")
+        logger.error(f"无法获取 dw_node 节点(插入后查询为空)，view={view_name}")
+        return 0
 
     def _ensure_dependency_nodes(self, dep_info: Dict[str, Dict[str, Any]], default_db: str) -> Dict[str, int]:
         nodes: Dict[str, int] = {}
