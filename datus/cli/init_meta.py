@@ -110,9 +110,9 @@ DW_META_TABLES: tuple[TableDefinition, ...] = (
         columns="""
 table_id        BIGINT NOT NULL AUTO_INCREMENT,
 source_system  VARCHAR(64) NOT NULL COMMENT 'ERP/CRM/..',
-table_name      VARCHAR(256) NOT NULL COMMENT '源视图名',
+table_name      VARCHAR(256) NOT NULL COMMENT '源表或视图名称',
 table_type     VARCHAR(32) NOT NULL COMMENT 'TABLE/VIEW/MATERIALIZED_VIEW',
-ddl_sql        STRING       NOT NULL COMMENT '视图定义SQL',
+ddl_sql        STRING       NOT NULL COMMENT '表或视图定义SQL',
 hash           VARCHAR(64)  NULL COMMENT 'SQL hash，避免重复处理',
 created_at     DATETIME,
 updated_at     DATETIME,
@@ -124,9 +124,9 @@ PRIMARY KEY (table_id)
         columns="""
 node_id           BIGINT NOT NULL AUTO_INCREMENT,
 node_type         VARCHAR(32) NOT NULL COMMENT 'ODS_TABLE/SRC_VIEW/DIM_TABLE/DWD_TABLE/DWS_TABLE',
-db_name           VARCHAR(128) NOT NULL,
+source_system     VARCHAR(64) NOT NULL COMMENT 'ERP/CRM/..',
 table_name        VARCHAR(256) NOT NULL,
-source_view_id    BIGINT NULL COMMENT '如果是由某个视图迁移而来',
+source_table_id   BIGINT NULL COMMENT '如果是由某个表或视图迁移而来',
 ai_layer_suggest  VARCHAR(16) NULL COMMENT 'AI建议层：DIM/DWD/DWS/OTHER',
 ai_confidence     DECIMAL(5,4) NULL,
 human_layer_final VARCHAR(16) NULL COMMENT '人确认后的层级',
@@ -306,7 +306,7 @@ def compile_dw_meta_statements(target_dialect: str) -> List[str]:
         except SqlglotError as exc:  # pragma: no cover - parse errors handled upstream
             raise RuntimeError(f"Failed to parse Doris DDL: {exc}") from exc
         statements.append(expr.sql(dialect=target_dialect))
-        logger.info("编译 SQL 成功（方言=%s）: %s", target_dialect, statements[-1])
+        logger.debug(f"编译 SQL 成功（方言={target_dialect}）: {statements[-1]}")
     return statements
 
 
@@ -349,15 +349,11 @@ class SqlMeshMetaInitializer:
             return 1
 
         logger.info(
-            "准备在命名空间 '%s' 的数据库 '%s' 执行 %d 条建表语句，方言=%s",
-            self.namespace,
-            logic_db,
-            len(statements),
-            dialect,
+            f"准备在命名空间 '{self.namespace}' 的数据库 '{logic_db}' 执行 {len(statements)} 条建表语句，方言={dialect}",
         )
 
         for statement in statements:
-            logger.debug("执行SQL: %s", statement)
+            logger.debug(f"执行SQL: {statement}")
             result = connector.execute({"sql_query": statement})
             if not result.success or result.error:
                 error_msg = result.error or "Unknown error"
@@ -377,10 +373,7 @@ class SqlMeshMetaInitializer:
         if logic_db:
             if logic_db not in db_configs:
                 logger.error(
-                    "Database '%s' not found under namespace '%s'. Use --database to pick one of: %s",
-                    logic_db,
-                    self.namespace,
-                    ", ".join(sorted(db_configs.keys())),
+                    f"Database '{logic_db}' not found under namespace '{self.namespace}'. Use --database to pick one of: {', '.join(sorted(db_configs.keys()))}",
                 )
                 return None
             agent_config.current_database = logic_db
@@ -392,8 +385,6 @@ class SqlMeshMetaInitializer:
             return single
 
         logger.error(
-            "Namespace '%s' has multiple databases (%s). Please provide --database <logic_name>.",
-            self.namespace,
-            ", ".join(sorted(db_configs.keys())),
+            f"Namespace '{self.namespace}' has multiple databases ({', '.join(sorted(db_configs.keys()))}). Please provide --database <logic_name>.",
         )
         return None

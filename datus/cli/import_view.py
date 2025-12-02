@@ -16,7 +16,7 @@ from datus.tools.db_tools.db_manager import DBManager
 from datus.utils.ast_analyzer import AstAnalyzer
 from datus.utils.constants import DBType
 from datus.utils.loggings import get_logger
-from datus.utils.sql_utils import extract_table_names, normalize_sql, parse_table_name_parts
+from datus.utils.sql_utils import normalize_sql, parse_table_name_parts
 
 logger = get_logger(__name__)
 
@@ -39,8 +39,26 @@ class ImportViewRunner:
         self.namespace = namespace
         self.sourcedb = sourcedb
         self.strategy = strategy
-        # 源库连接：使用 sourcedb 逻辑名
-        self.source_conn = self.db_manager.get_conn(namespace, sourcedb)
+        # 源库连接：优先从 sourcedb 配置创建独立连接，否则使用 namespace 下的逻辑库
+        src_db_config = None
+        try:
+            src_db_config = agent_config.source_db_config(sourcedb)
+        except Exception:
+            src_db_config = None
+
+        if src_db_config:
+            from datus.tools.db_tools.db_manager import DBManager as SrcDBManager
+
+            self._src_db_manager = SrcDBManager({sourcedb: {src_db_config.logic_name or sourcedb: src_db_config}})
+            self.source_conn = self._src_db_manager.get_conn(sourcedb, src_db_config.logic_name or sourcedb)
+            self.source_db_name = src_db_config.database or ""
+            self.source_schema = src_db_config.schema or ""
+        else:
+            self._src_db_manager = None
+            self.source_conn = self.db_manager.get_conn(namespace, sourcedb)
+            self.source_db_name = getattr(self.source_conn, "database_name", "") or ""
+            self.source_schema = getattr(self.source_conn, "schema_name", "") or ""
+
         # 元库连接：使用 namespace 默认/当前数据库（init-meta 所在）
         meta_logic_db = getattr(agent_config, "current_database", None) or agent_config.current_database or ""
         self.meta_conn = self.db_manager.get_conn(namespace, meta_logic_db)
@@ -96,55 +114,79 @@ class ImportViewRunner:
 
         # DAG 排序（仅视图间依赖）
         view_name_set = {v.view_name.lower() for v in to_process + reused_views}
-        dep_graph, table_deps = self._build_dependency_graph(to_process + reused_views, view_name_set)
-        topo = self._topo_sort(dep_graph)
+        view_records = to_process + reused_views
+        if not view_records:
+            return {"new_views": len(new_view_ids), "processed": 0, "failed": 0, "reused": len(reused_views)}
 
-        # AST 分析 + 落表
+        table_source_map = self._load_table_source_map()
+
         processed, failed = 0, 0
-        for view_name in topo:
-            row = self._find_row(view_name, to_process + reused_views)
-            if not row or not row.view_id:
+        analysis_results: List[Dict[str, Any]] = []
+        for row in view_records:
+            if not row.view_id:
+                logger.warning("视图 %s 缺少 view_id，跳过解析", row.view_name)
                 continue
             try:
                 ddl_sql = row.ddl_sql or ""
-                logger.debug("待解析视图 %s DDL: %s", row.view_name, ddl_sql)
+                logger.debug(f"待解析视图 {row.view_name} DDL: {ddl_sql}")
                 parsed_sql = self._strip_create_view(ddl_sql)
                 parsed_sql = self._strip_to_first_statement(parsed_sql)
                 feature = self.ast.analyze_view(parsed_sql, row.view_name)
+                deps = self._resolve_dependencies(feature, table_source_map, row.db_name)
+                if deps["unresolved"]:
+                    logger.warning("视图 %s 依赖未解析: %s", row.view_name, deps["unresolved"])
                 feature["status"] = "OK"
-                feature["table_dependencies"] = sorted(table_deps.get(view_name.lower(), []))
+                feature["view_dependencies"] = sorted(deps["view_dependencies"])
+                feature["table_dependencies"] = sorted(deps["table_dependencies"])
+                feature["unresolved_dependencies"] = sorted(deps["unresolved"])
                 feature_json = json.dumps(feature, ensure_ascii=True)
                 self._upsert_ai_view_feature(row.view_id, feature_json)
-                node_id = self._ensure_view_node(row.view_id, row.view_name, row.db_name)
-                alias_map = {t["alias"]: t for t in feature.get("tables", [])}
-                table_nodes = self._ensure_table_nodes(feature, row.db_name)
-                self._upsert_relations(node_id, table_nodes, feature, alias_map)
-                std_items = self._prepare_std_items(feature, alias_map, row.view_name, row.db_name)
-                self._persist_std_and_feedback(row.view_name, row.db_name, std_items)
+                view_node_id = self._ensure_view_node(row.view_id, row.view_name, row.db_name)
+                dependency_nodes = self._ensure_dependency_nodes(deps["dep_info"], row.db_name)
+                self._upsert_relations(view_node_id, dependency_nodes, feature, deps["dep_info"])
+                alias_map = {
+                    (t.get("alias") or t.get("resolved_name") or t.get("name")): t for t in feature.get("tables", [])
+                }
+                analysis_results.append(
+                    {
+                        "row": row,
+                        "feature": feature,
+                        "alias_map": alias_map,
+                    }
+                )
                 processed += 1
             except Exception as exc:  # pragma: no cover
-                logger.error("视图解析失败 %s: %s", row.view_name, exc)
+                logger.error(f"视图解析失败 {row.view_name}: {exc}")
                 error_json = json.dumps({"status": "ERROR", "error": str(exc)}, ensure_ascii=True)
                 self._upsert_ai_view_feature(row.view_id, error_json)
                 failed += 1
 
-        return {
-            "new_views": len(new_view_ids),
-            "processed": processed,
-            "failed": failed,
-            "reused": len(reused_views),
-        }
+        dep_graph = self._build_view_dep_graph(analysis_results)
+        topo = self._topo_sort(dep_graph)
+        analysis_map = {r["row"].view_name.lower(): r for r in analysis_results}
+        for view_name in topo:
+            result = analysis_map.get(view_name)
+            if not result:
+                continue
+            std_items = self._prepare_std_items(
+                result["feature"], result["alias_map"], result["row"].view_name, result["row"].db_name
+            )
+            self._persist_std_and_feedback(result["row"].view_name, result["row"].db_name, std_items)
+
+        return {"new_views": len(new_view_ids), "processed": processed, "failed": failed, "reused": len(reused_views)}
 
     # ---------- 视图与 hash ---------- #
     def _load_views(self) -> List[Dict[str, str]]:
         views = []
         if hasattr(self.source_conn, "get_views_with_ddl"):
-            db_name = getattr(self.source_conn, "database_name", "") or getattr(self.source_conn, "schema_name", "") or ""
-            schema_name = getattr(self.source_conn, "schema_name", "")
+            db_name = self.source_db_name or getattr(self.source_conn, "database_name", "") or ""
+            schema_name = self.source_schema or getattr(self.source_conn, "schema_name", "") or ""
+            logger.info(f"准备拉取视图 DDL，db={db_name} schema={schema_name} connector={type(self.source_conn).__name__}")
             try:
                 views = self.source_conn.get_views_with_ddl(database_name=db_name, schema_name=schema_name)
             except TypeError:
                 views = self.source_conn.get_views_with_ddl()
+            logger.info(f"已从源库获取视图 {len(views)} 个")
         else:
             logger.warning("连接器不支持 get_views_with_ddl，无法导入视图")
         return views
@@ -152,12 +194,14 @@ class ImportViewRunner:
     def _load_tables(self) -> List[Dict[str, str]]:
         tables = []
         if hasattr(self.source_conn, "get_tables_with_ddl"):
-            db_name = getattr(self.source_conn, "database_name", "") or getattr(self.source_conn, "schema_name", "") or ""
-            schema_name = getattr(self.source_conn, "schema_name", "")
+            db_name = self.source_db_name or getattr(self.source_conn, "database_name", "") or ""
+            schema_name = self.source_schema or getattr(self.source_conn, "schema_name", "") or ""
+            logger.info(f"准备拉取表 DDL，db={db_name} schema={schema_name} connector={type(self.source_conn).__name__}")
             try:
                 tables = self.source_conn.get_tables_with_ddl(database_name=db_name, schema_name=schema_name)
             except Exception as exc:
-                logger.warning("获取表 DDL 失败: %s", exc)
+                logger.warning(f"获取表 DDL 失败: {exc}")
+            logger.info(f"已从源库获取表 {len(tables)} 个")
         return tables
 
     def _normalize_view(self, view_meta: Dict[str, str]) -> ViewSourceRow:
@@ -192,6 +236,23 @@ class ImportViewRunner:
                 sql_hash=row.get("hash", "") or "",
             )
         return existing
+
+    def _load_table_source_map(self) -> Dict[str, Dict[str, Any]]:
+        sql = (
+            "SELECT table_id, table_name, table_type "
+            "FROM dw_meta.table_source "
+            f"WHERE source_system = '{self.sourcedb}'"
+        )
+        result = self.meta_conn.execute({"sql_query": sql, "result_format": "list"})
+        rows = self._rows_from_result(result)
+        mapping: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            name = str(row.get("table_name") or "").lower()
+            mapping[name] = {
+                "table_id": row.get("table_id"),
+                "table_type": (row.get("table_type") or "").upper(),
+            }
+        return mapping
 
     def _load_existing_table_source(self, table_type: str = "VIEW") -> Dict[str, ViewSourceRow]:
         sql = (
@@ -286,25 +347,58 @@ class ImportViewRunner:
         status = (rows[0].get("migration_status") or "").upper()
         return status in {"REVIEWED", "IMPLEMENTED", "SKIPPED"}
 
-    # ---------- DAG ---------- #
-    def _build_dependency_graph(
-        self, views: List[ViewSourceRow], view_name_set: Set[str]
-    ) -> Tuple[Dict[str, Set[str]], Dict[str, Set[str]]]:
-        graph: Dict[str, Set[str]] = {}
-        table_deps: Dict[str, Set[str]] = {}
-        for row in views:
-            deps = extract_table_names(row.ddl_sql, dialect=DBType.ORACLE)
-            view_deps = set()
-            physical = set()
-            for dep in deps:
-                dep_norm = dep.lower()
-                if dep_norm in view_name_set:
-                    view_deps.add(dep_norm)
+    # ---------- 依赖解析与 DAG ---------- #
+    def _resolve_dependencies(
+        self, feature: Dict[str, Any], table_source_map: Dict[str, Dict[str, Any]], default_db: str
+    ) -> Dict[str, Any]:
+        """
+        基于 table_source 判定表/视图依赖类型，并构建节点所需信息。
+        """
+        view_deps: Set[str] = set()
+        table_deps: Set[str] = set()
+        unresolved: Set[str] = set()
+        dep_info: Dict[str, Dict[str, Any]] = {}
+        tables = feature.get("tables") or []
+        for t in tables:
+            alias = t.get("alias") or t.get("name") or ""
+            raw_name = t.get("name") or ""
+            parsed = parse_table_name_parts(raw_name, dialect=DBType.ORACLE)
+            resolved_name = parsed.get("table_name") or raw_name
+            dep_key = resolved_name.lower()
+            db_name = t.get("db") or default_db
+            info = table_source_map.get(dep_key)
+            alias_key = alias or resolved_name
+            if info:
+                dep_type = "VIEW" if (info.get("table_type") or "").upper() == "VIEW" else "TABLE"
+                t["source_type"] = dep_type
+                t["resolved_name"] = resolved_name
+                dep_info[alias_key] = {
+                    "name": resolved_name,
+                    "db_name": db_name,
+                    "type": dep_type,
+                    "source_table_id": info.get("table_id"),
+                }
+                if dep_type == "VIEW":
+                    view_deps.add(dep_key)
                 else:
-                    physical.add(dep_norm)
-            graph[row.view_name.lower()] = view_deps
-            table_deps[row.view_name.lower()] = physical
-        return graph, table_deps
+                    table_deps.add(dep_key)
+            else:
+                unresolved.add(resolved_name)
+        return {
+            "view_dependencies": view_deps,
+            "table_dependencies": table_deps,
+            "unresolved": unresolved,
+            "dep_info": dep_info,
+        }
+
+    def _build_view_dep_graph(self, analysis_results: List[Dict[str, Any]]) -> Dict[str, Set[str]]:
+        view_set = {r["row"].view_name.lower() for r in analysis_results}
+        graph: Dict[str, Set[str]] = {}
+        for result in analysis_results:
+            view_nm = result["row"].view_name.lower()
+            deps = set(result["feature"].get("view_dependencies") or [])
+            graph[view_nm] = {d for d in deps if d in view_set}
+        return graph
 
     def _topo_sort(self, graph: Dict[str, Set[str]]) -> List[str]:
         indeg: Dict[str, int] = {k: 0 for k in graph}
@@ -347,18 +441,35 @@ class ImportViewRunner:
 
     def _ensure_view_node(self, view_id: int, view_name: str, db_name: str) -> int:
         fetch = self.meta_conn.execute(
-            {"sql_query": f"SELECT node_id FROM dw_meta.dw_node WHERE source_view_id = {view_id} LIMIT 1"}
+            {
+                "sql_query": (
+                    "SELECT node_id, node_type FROM dw_meta.dw_node "
+                    f"WHERE source_view_id = {view_id} LIMIT 1"
+                )
+            }
         )
         rows = self._rows_from_result(fetch)
-        if rows:
-            return int(rows[0].get("node_id"))
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        if rows:
+            node_id = int(rows[0].get("node_id"))
+            if (rows[0].get("node_type") or "").upper() != "VIEW":
+                self.meta_conn.execute(
+                    {
+                        "sql_query": (
+                            "UPDATE dw_meta.dw_node SET node_type = 'VIEW', updated_at = "
+                            f"'{now}' WHERE node_id = {node_id}"
+                        )
+                    }
+                )
+            return node_id
         view_name_esc = self._escape(view_name)
         db_name_esc = self._escape(db_name)
         insert = (
             "INSERT INTO dw_meta.dw_node "
-            "(node_type, db_name, table_name, source_view_id, migration_status, created_at, updated_at) "
-            f"VALUES ('SRC_VIEW', '{db_name_esc}', '{view_name_esc}', {view_id}, 'NEW', '{now}', '{now}')"
+            "(node_type, source_system, db_name, table_name, source_table_id, source_view_id, migration_status, "
+            "created_at, updated_at) "
+            f"VALUES ('VIEW', '{self._escape(self.sourcedb)}', '{db_name_esc}', '{view_name_esc}', "
+            f"{view_id}, {view_id}, 'NEW', '{now}', '{now}')"
         )
         self.meta_conn.execute({"sql_query": insert})
         res = self.meta_conn.execute(
@@ -374,62 +485,65 @@ class ImportViewRunner:
             return int(rows2[0].get("node_id"))
         raise RuntimeError(f"无法获取 dw_node 节点: {view_name}")
 
-    def _ensure_table_nodes(self, feature: Dict[str, Any], db_name: str) -> Dict[str, int]:
+    def _ensure_dependency_nodes(self, dep_info: Dict[str, Dict[str, Any]], default_db: str) -> Dict[str, int]:
         nodes: Dict[str, int] = {}
-        tables = feature.get("tables") or []
-        for t in tables:
-            table_name = t.get("name") or ""
-            alias = t.get("alias") or table_name
-            parsed = parse_table_name_parts(table_name, dialect=DBType.ORACLE)
-            table_db = self._escape(parsed.get("database_name") or db_name)
-            table_nm = self._escape(parsed.get("table_name") or "")
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        for alias, info in dep_info.items():
+            db = self._escape(info.get("db_name") or default_db)
+            table_nm = self._escape(info.get("name") or "")
+            node_type = "VIEW" if info.get("type") == "VIEW" else "TABLE"
+            source_table_id = info.get("source_table_id")
             fetch = self.meta_conn.execute(
                 {
                     "sql_query": (
                         "SELECT node_id FROM dw_meta.dw_node "
-                        f"WHERE db_name = '{table_db}' AND table_name = '{table_nm}' LIMIT 1"
+                        f"WHERE source_system = '{self._escape(self.sourcedb)}' "
+                        f"AND db_name = '{db}' AND table_name = '{table_nm}' LIMIT 1"
                     )
                 }
             )
-            node_id = None
             rows = self._rows_from_result(fetch)
             if rows:
                 node_id = int(rows[0].get("node_id"))
             else:
-                now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
                 insert = (
                     "INSERT INTO dw_meta.dw_node "
-                    "(node_type, db_name, table_name, migration_status, created_at, updated_at) "
-                    f"VALUES ('ODS_TABLE', '{table_db}', '{table_nm}', 'NEW', '{now}', '{now}')"
+                    "(node_type, source_system, db_name, table_name, source_table_id, migration_status, created_at, updated_at) "
+                    f"VALUES ('{node_type}', '{self._escape(self.sourcedb)}', '{db}', '{table_nm}', "
+                    f"{source_table_id if source_table_id is not None else 'NULL'}, 'NEW', '{now}', '{now}')"
                 )
                 self.meta_conn.execute({"sql_query": insert})
                 res = self.meta_conn.execute(
                     {
                         "sql_query": (
                             "SELECT node_id FROM dw_meta.dw_node "
-                            f"WHERE db_name = '{table_db}' AND table_name = '{table_nm}' "
+                            f"WHERE source_system = '{self._escape(self.sourcedb)}' "
+                            f"AND db_name = '{db}' AND table_name = '{table_nm}' "
                             "ORDER BY node_id DESC LIMIT 1"
                         )
                     }
                 )
-                rows2 = self._rows_from_result(res)
-                if rows2:
-                    node_id = int(rows2[0].get("node_id"))
-            if node_id is not None:
-                nodes[alias] = node_id
+                rows = self._rows_from_result(res)
+            if rows:
+                nodes[alias] = int(rows[0].get("node_id"))
         return nodes
 
     def _upsert_relations(
-        self, view_node_id: int, table_nodes: Dict[str, int], feature: Dict[str, Any], alias_map: Dict[str, Dict]
+        self, view_node_id: int, dependency_nodes: Dict[str, int], feature: Dict[str, Any], dep_info: Dict[str, Dict]
     ):
-        for alias, node_id in table_nodes.items():
-            self._insert_relation(view_node_id, node_id, "VIEW_DEP", json.dumps({"alias": alias}))
+        for alias, node_id in dependency_nodes.items():
+            info = dep_info.get(alias) or {}
+            detail = json.dumps(
+                {"alias": alias, "dependency_type": info.get("type"), "table_name": info.get("name")},
+                ensure_ascii=True,
+            )
+            self._insert_relation(view_node_id, node_id, "VIEW_DEP", detail)
 
         for join in feature.get("joins") or []:
             left_alias = join.get("left_alias") or ""
             right_alias = join.get("right_alias") or ""
-            left_id = table_nodes.get(left_alias)
-            right_id = table_nodes.get(right_alias)
+            left_id = dependency_nodes.get(left_alias)
+            right_id = dependency_nodes.get(right_alias)
             if left_id and right_id:
                 detail = json.dumps(join, ensure_ascii=True)
                 self._insert_relation(left_id, right_id, "JOIN", detail)
@@ -466,7 +580,8 @@ class ImportViewRunner:
             src_col = col.get("source_column")
             table_name = view_name
             if src_alias and src_alias in alias_map:
-                table_name = alias_map[src_alias].get("name") or view_name
+                table_meta = alias_map[src_alias]
+                table_name = table_meta.get("resolved_name") or table_meta.get("name") or view_name
             items.append(
                 {
                     "std_field_name": self._to_snake(col.get("output_name") or ""),
@@ -488,7 +603,7 @@ class ImportViewRunner:
             try:
                 self.llm = LLMBaseModel.create_model(model_name="default", agent_config=self.agent_config)
             except Exception as exc:  # pragma: no cover
-                logger.warning("初始化 LLM 失败，改为人工确认模式: %s", exc)
+                logger.warning(f"初始化 LLM 失败，改为人工确认模式: {exc}")
                 self.llm = None
 
         for item in items:
