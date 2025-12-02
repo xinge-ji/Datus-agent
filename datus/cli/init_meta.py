@@ -207,7 +207,7 @@ partition_key        VARCHAR(128) NULL,
 distributed_key      VARCHAR(128) NULL,
 incremental_strategy VARCHAR(64)  NULL,
 default_filter       STRING NULL COMMENT '如 is_active = 1',
-source_view_id       BIGINT NULL COMMENT '原始视图ID',
+source_table_id      BIGINT NULL COMMENT '原始表或视图ID',
 status               VARCHAR(16) DEFAULT 'DRAFT' COMMENT 'DRAFT/ACTIVE/DEPRECATED',
 created_at           DATETIME,
 updated_at           DATETIME,
@@ -236,10 +236,10 @@ PRIMARY KEY (model_id, column_name)
     TableDefinition(
         name="ai_view_feature",
         columns="""
-view_id      BIGINT NOT NULL,
+table_id     BIGINT NOT NULL,
 feature_json STRING NOT NULL COMMENT 'sqlglot 抽取的特征 JSON',
 analyzed_at  DATETIME,
-PRIMARY KEY (view_id)
+PRIMARY KEY (table_id)
 """,
     ),
     TableDefinition(
@@ -361,9 +361,7 @@ class SqlMeshMetaInitializer:
                 return 1
 
         logger.info(
-            "dw_meta metadata schema initialized on namespace '%s' (database '%s')",
-            self.namespace,
-            logic_db,
+            f"dw_meta metadata schema initialized on namespace '{self.namespace}' (database '{logic_db}')",
         )
         return 0
 

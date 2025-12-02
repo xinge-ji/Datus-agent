@@ -131,6 +131,7 @@ class ImportViewRunner:
                 logger.debug(f"待解析视图 {row.view_name} DDL: {ddl_sql}")
                 parsed_sql = self._strip_create_view(ddl_sql)
                 parsed_sql = self._strip_to_first_statement(parsed_sql)
+                parsed_sql = self._strip_oracle_plus(parsed_sql)
                 feature = self.ast.analyze_view(parsed_sql, row.view_name)
                 deps = self._resolve_dependencies(feature, table_source_map, row.db_name)
                 if deps["unresolved"]:
@@ -322,12 +323,12 @@ class ImportViewRunner:
             {
                 "sql_query": (
                     "DELETE FROM dw_meta.dw_node_relation WHERE from_node_id IN "
-                    f"(SELECT node_id FROM dw_meta.dw_node WHERE source_view_id IN ({id_list})) "
-                    "OR to_node_id IN (SELECT node_id FROM dw_meta.dw_node WHERE source_view_id IN ({id_list}))"
+                    f"(SELECT node_id FROM dw_meta.dw_node WHERE source_table_id IN ({id_list})) "
+                    "OR to_node_id IN (SELECT node_id FROM dw_meta.dw_node WHERE source_table_id IN ({id_list}))"
                 )
             }
         )
-        self.meta_conn.execute({"sql_query": f"DELETE FROM dw_meta.dw_node WHERE source_view_id IN ({id_list})"})
+        self.meta_conn.execute({"sql_query": f"DELETE FROM dw_meta.dw_node WHERE source_table_id IN ({id_list})"})
         self.meta_conn.execute(
             {"sql_query": f"DELETE FROM dw_meta.ai_feedback WHERE object_type = 'VIEW' AND object_key IN ({names_sql})"}
         )
@@ -337,7 +338,7 @@ class ImportViewRunner:
             return False
         sql = (
             "SELECT migration_status FROM dw_meta.dw_node "
-            f"WHERE source_view_id = {view_id} "
+            f"WHERE source_table_id = {view_id} "
             "ORDER BY node_id DESC LIMIT 1"
         )
         res = self.meta_conn.execute({"sql_query": sql, "result_format": "list"})
@@ -440,43 +441,62 @@ class ImportViewRunner:
         self.meta_conn.execute({"sql_query": sql})
 
     def _ensure_view_node(self, view_id: int, view_name: str, db_name: str) -> int:
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        view_name_esc = self._escape(view_name)
+        db_name_esc = self._escape(db_name)
+        # 先按 source_table_id 查，兼容旧数据再按 source_system+table_name 查
         fetch = self.meta_conn.execute(
             {
                 "sql_query": (
-                    "SELECT node_id, node_type FROM dw_meta.dw_node "
-                    f"WHERE source_view_id = {view_id} LIMIT 1"
+                    "SELECT node_id, node_type, source_table_id FROM dw_meta.dw_node "
+                    f"WHERE source_table_id = {view_id} LIMIT 1"
                 )
             }
         )
         rows = self._rows_from_result(fetch)
-        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        if not rows:
+            fetch = self.meta_conn.execute(
+                {
+                    "sql_query": (
+                        "SELECT node_id, node_type, source_table_id FROM dw_meta.dw_node "
+                        f"WHERE source_system = '{self._escape(self.sourcedb)}' "
+                        f"AND table_name = '{view_name_esc}' LIMIT 1"
+                    )
+                }
+            )
+            rows = self._rows_from_result(fetch)
+
         if rows:
             node_id = int(rows[0].get("node_id"))
+            updates = []
             if (rows[0].get("node_type") or "").upper() != "VIEW":
+                updates.append("node_type = 'VIEW'")
+            if not rows[0].get("source_table_id"):
+                updates.append(f"source_table_id = {view_id}")
+            if updates:
+                updates.append(f"updated_at = '{now}'")
                 self.meta_conn.execute(
                     {
                         "sql_query": (
-                            "UPDATE dw_meta.dw_node SET node_type = 'VIEW', updated_at = "
-                            f"'{now}' WHERE node_id = {node_id}"
+                            "UPDATE dw_meta.dw_node SET " + ", ".join(updates) + f" WHERE node_id = {node_id}"
                         )
                     }
                 )
             return node_id
-        view_name_esc = self._escape(view_name)
-        db_name_esc = self._escape(db_name)
+
         insert = (
             "INSERT INTO dw_meta.dw_node "
-            "(node_type, source_system, db_name, table_name, source_table_id, source_view_id, migration_status, "
+            "(node_type, source_system, db_name, table_name, source_table_id, migration_status, "
             "created_at, updated_at) "
             f"VALUES ('VIEW', '{self._escape(self.sourcedb)}', '{db_name_esc}', '{view_name_esc}', "
-            f"{view_id}, {view_id}, 'NEW', '{now}', '{now}')"
+            f"{view_id}, 'NEW', '{now}', '{now}')"
         )
         self.meta_conn.execute({"sql_query": insert})
         res = self.meta_conn.execute(
             {
                 "sql_query": (
                     "SELECT node_id FROM dw_meta.dw_node "
-                    f"WHERE source_view_id = {view_id} ORDER BY node_id DESC LIMIT 1"
+                    f"WHERE source_table_id = {view_id} ORDER BY node_id DESC LIMIT 1"
                 )
             }
         )
@@ -752,6 +772,9 @@ class ImportViewRunner:
         ansi_re = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]", re.IGNORECASE)
         return ansi_re.sub("", text)
 
+    def _strip_oracle_plus(self, text: str) -> str:
+        plus_re = re.compile(r"\(\+\)", re.IGNORECASE)
+        return plus_re.sub("", text)
 
 def run_import_view(agent_config: AgentConfig, db_manager: DBManager, args) -> Dict[str, Any]:
     runner = ImportViewRunner(
