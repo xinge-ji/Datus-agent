@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -48,7 +49,10 @@ class ImportViewRunner:
     # ---------- 对外入口 ---------- #
     def run(self) -> Dict[str, Any]:
         """执行全流程，返回简单统计。"""
+        all_tables = self._load_tables()
         all_views = self._load_views()
+        table_existing = self._load_existing_table_source(table_type="TABLE")
+        view_table_existing = self._load_existing_table_source(table_type="VIEW")
         existing = self._load_existing_view_source()
 
         if self.strategy == "overwrite":
@@ -59,9 +63,16 @@ class ImportViewRunner:
         reused_views: List[ViewSourceRow] = []
         new_view_ids: List[int] = []
 
+        # 先同步物理表 DDL 到 table_source
+        for tbl in all_tables:
+            row = self._normalize_view(tbl)
+            key = row.view_name.lower()
+            self._upsert_table_source(row, table_existing.get(key), table_type="TABLE")
+
         for view_meta in all_views:
             row = self._normalize_view(view_meta)
             key = row.view_name.lower()
+            self._upsert_table_source(row, view_table_existing.get(key), table_type="VIEW")
             latest = existing.get(key)
             if self.strategy == "incremental" and latest and latest.sql_hash == row.sql_hash:
                 # 未变更，检查 dw_node 状态
@@ -90,7 +101,11 @@ class ImportViewRunner:
             if not row or not row.view_id:
                 continue
             try:
-                feature = self.ast.analyze_view(row.ddl_sql, row.view_name)
+                ddl_sql = row.ddl_sql or ""
+                logger.debug("待解析视图 %s DDL: %s", row.view_name, ddl_sql)
+                parsed_sql = self._strip_create_view(ddl_sql)
+                parsed_sql = self._strip_to_first_statement(parsed_sql)
+                feature = self.ast.analyze_view(parsed_sql, row.view_name)
                 feature["status"] = "OK"
                 feature["table_dependencies"] = sorted(table_deps.get(view_name.lower(), []))
                 feature_json = json.dumps(feature, ensure_ascii=True)
@@ -125,13 +140,24 @@ class ImportViewRunner:
             logger.warning("连接器不支持 get_views_with_ddl，无法导入视图")
         return views
 
+    def _load_tables(self) -> List[Dict[str, str]]:
+        """从源库读取表 DDL（若支持）。"""
+        tables = []
+        if hasattr(self.source_conn, "get_tables_with_ddl"):
+            try:
+                tables = self.source_conn.get_tables_with_ddl()
+            except Exception as exc:
+                logger.warning("获取表 DDL 失败: %s", exc)
+        return tables
+
     def _normalize_view(self, view_meta: Dict[str, str]) -> ViewSourceRow:
         ddl_sql = view_meta.get("definition") or view_meta.get("ddl") or ""
+        ddl_sql = self._strip_ansi(ddl_sql)
         normalized = normalize_sql(ddl_sql).lower()
         sql_hash = hashlib.md5(normalized.encode("utf-8")).hexdigest()
         return ViewSourceRow(
             view_id=None,
-            view_name=view_meta.get("table_name") or view_meta.get("view_name") or "",
+            view_name=view_meta.get("table_name") or view_meta.get("view_name") or view_meta.get("name") or "",
             db_name=view_meta.get("database_name") or self.sourcedb,
             ddl_sql=ddl_sql,
             sql_hash=sql_hash,
@@ -152,6 +178,26 @@ class ImportViewRunner:
                 view_id=row.get("view_id"),
                 view_name=row.get("view_name", ""),
                 db_name=row.get("db_name", ""),
+                ddl_sql=row.get("ddl_sql", ""),
+                sql_hash=row.get("hash", "") or "",
+            )
+        return existing
+
+    def _load_existing_table_source(self, table_type: str = "VIEW") -> Dict[str, ViewSourceRow]:
+        sql = (
+            "SELECT table_id as view_id, table_name as view_name, '' as db_name, ddl_sql, hash "
+            "FROM dw_meta.table_source "
+            f"WHERE source_system = '{self.sourcedb}' AND table_type = '{table_type}'"
+        )
+        result = self.meta_conn.execute({"sql_query": sql, "result_format": "list"})
+        rows = self._rows_from_result(result)
+        existing: Dict[str, ViewSourceRow] = {}
+        for row in rows:
+            key = str(row.get("view_name", "")).lower()
+            existing[key] = ViewSourceRow(
+                view_id=row.get("view_id"),
+                view_name=row.get("view_name", ""),
+                db_name="",
                 ddl_sql=row.get("ddl_sql", ""),
                 sql_hash=row.get("hash", "") or "",
             )
@@ -180,6 +226,34 @@ class ImportViewRunner:
         if rows:
             return int(rows[0].get("view_id"))
         raise RuntimeError(f"无法获取 view_id: {row.view_name}")
+
+    def _upsert_table_source(
+        self, row: ViewSourceRow, existing: Optional[ViewSourceRow], table_type: str = "VIEW"
+    ) -> int:
+        """将定义同步到 table_source。返回 table_id。"""
+        if existing and existing.sql_hash == row.sql_hash:
+            return existing.view_id or 0
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        view_name = self._escape(row.view_name)
+        ddl_sql = self._escape(row.ddl_sql)
+        sql_hash = self._escape(row.sql_hash)
+        insert = (
+            "INSERT INTO dw_meta.table_source "
+            "(source_system, table_name, table_type, ddl_sql, hash, created_at, updated_at) "
+            f"VALUES ('{self.sourcedb}', '{view_name}', '{table_type}', '{ddl_sql}', '{sql_hash}', '{now}', '{now}')"
+        )
+        self.meta_conn.execute({"sql_query": insert})
+        res = self.meta_conn.execute(
+            {
+                "sql_query": (
+                    "SELECT table_id FROM dw_meta.table_source "
+                    f"WHERE source_system = '{self.sourcedb}' AND table_name = '{view_name}' "
+                    "ORDER BY table_id DESC LIMIT 1"
+                )
+            }
+        )
+        rows = self._rows_from_result(res)
+        return int(rows[0].get("table_id")) if rows else 0
 
     def _cleanup_downstream(self, view_names: List[str]):
         if not view_names:
@@ -313,8 +387,9 @@ class ImportViewRunner:
                 )
             }
         )
-        if res and res.success and res.sql_return:
-            return int(res.sql_return[0].get("node_id"))
+        rows2 = self._rows_from_result(res)
+        if rows2:
+            return int(rows2[0].get("node_id"))
         raise RuntimeError(f"无法获取 dw_node 节点: {view_name}")
 
     def _ensure_table_nodes(self, feature: Dict[str, Any], db_name: str) -> Dict[str, int]:
@@ -326,23 +401,23 @@ class ImportViewRunner:
             parsed = parse_table_name_parts(table_name, dialect=DBType.ORACLE)
             table_db = self._escape(parsed.get("database_name") or db_name)
             table_nm = self._escape(parsed.get("table_name") or "")
-        fetch = self.meta_conn.execute(
-            {
-                "sql_query": (
-                    "SELECT node_id FROM dw_meta.dw_node "
-                    f"WHERE db_name = '{table_db}' AND table_name = '{table_nm}' LIMIT 1"
-                )
-            }
-        )
-        node_id = None
-        rows = self._rows_from_result(fetch)
-        if rows:
-            node_id = int(rows[0].get("node_id"))
-        else:
-            now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-            insert = (
-                "INSERT INTO dw_meta.dw_node "
-                "(node_type, db_name, table_name, migration_status, created_at, updated_at) "
+            fetch = self.meta_conn.execute(
+                {
+                    "sql_query": (
+                        "SELECT node_id FROM dw_meta.dw_node "
+                        f"WHERE db_name = '{table_db}' AND table_name = '{table_nm}' LIMIT 1"
+                    )
+                }
+            )
+            node_id = None
+            rows = self._rows_from_result(fetch)
+            if rows:
+                node_id = int(rows[0].get("node_id"))
+            else:
+                now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                insert = (
+                    "INSERT INTO dw_meta.dw_node "
+                    "(node_type, db_name, table_name, migration_status, created_at, updated_at) "
                     f"VALUES ('ODS_TABLE', '{table_db}', '{table_nm}', 'NEW', '{now}', '{now}')"
                 )
                 self.meta_conn.execute({"sql_query": insert})
@@ -358,8 +433,8 @@ class ImportViewRunner:
                 rows2 = self._rows_from_result(res)
                 if rows2:
                     node_id = int(rows2[0].get("node_id"))
-        if node_id is not None:
-            nodes[alias] = node_id
+            if node_id is not None:
+                nodes[alias] = node_id
         return nodes
 
     def _upsert_relations(
@@ -565,6 +640,31 @@ class ImportViewRunner:
                 return []
         return []
 
+    def _strip_create_view(self, ddl_sql: str) -> str:
+        """
+        剥离 CREATE VIEW 前缀，取 AS 后主体；若失败，返回原文。
+        """
+        text = ddl_sql.strip().rstrip(";")
+        pattern = re.compile(r"create\s+(or\s+replace\s+)?(force\s+)?view\s+.+?\bas\b", re.IGNORECASE | re.DOTALL)
+        m = pattern.search(text)
+        if m:
+            return text[m.end() :].strip()
+        return text
+
+    def _strip_to_first_statement(self, ddl_sql: str) -> str:
+        """
+        找到首个 SELECT/WITH/INSERT 位置，截取后续语句，避免头部噪声。
+        """
+        pattern = re.compile(r"\b(select|with|insert)\b", re.IGNORECASE)
+        m = pattern.search(ddl_sql)
+        if m:
+            return ddl_sql[m.start() :].strip()
+        return ddl_sql.strip()
+
+    def _strip_ansi(self, text: str) -> str:
+        """去除 ANSI 控制符，避免 sqlglot 解析错误。"""
+        ansi_re = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]", re.IGNORECASE)
+        return ansi_re.sub("", text)
 
 def run_import_view(agent_config: AgentConfig, db_manager: DBManager, args) -> Dict[str, Any]:
     runner = ImportViewRunner(

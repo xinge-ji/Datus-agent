@@ -8,8 +8,10 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
 
-import sqlglot
 from sqlglot import exp, parse_one
+from datus.utils.loggings import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -73,10 +75,23 @@ class AstAnalyzer:
         :param view_name: 可选，视图名
         :return: 可 JSON 序列化的 dict
         """
+        # 先尝试使用配置的方言（默认 Oracle），如果失败则回退到 MySQL
         try:
             root: exp.Expression = parse_one(sql_text, read=self.dialect)
-        except Exception as exc:
-            raise ValueError(f"Failed to parse SQL for view {view_name or ''}: {exc}") from exc
+            logger.debug(f"Successfully parsed SQL for view {view_name or ''} using {self.dialect} dialect")
+        except Exception as oracle_exc:
+            logger.debug(
+                f"Failed to parse SQL for view {view_name or ''} using {self.dialect} dialect: {oracle_exc}. "
+                f"Falling back to MySQL dialect."
+            )
+            try:
+                root: exp.Expression = parse_one(sql_text, read="mysql")
+                logger.debug(f"Successfully parsed SQL for view {view_name or ''} using MySQL dialect (fallback)")
+            except Exception as mysql_exc:
+                raise ValueError(
+                    f"Failed to parse SQL for view {view_name or ''} with both {self.dialect} and MySQL dialects. "
+                    f"Oracle error: {oracle_exc}. MySQL error: {mysql_exc}"
+                ) from mysql_exc
 
         tables = self._collect_tables(root)
         columns = self._collect_columns(root)
@@ -129,7 +144,9 @@ class AstAnalyzer:
                 for g_exp in group.expressions:
                     group_keys.add(g_exp.sql(dialect=self.dialect))
 
-            agg_funcs: List[exp.Func] = [fn for fn in select.find_all(exp.Func) if fn.is_aggregate]
+            agg_funcs: List[exp.Func] = [
+                fn for fn in select.find_all(exp.Func) if getattr(fn, "is_aggregate", False)
+            ]
             agg_expr_sqls = {fn.sql(dialect=self.dialect) for fn in agg_funcs}
             window_exprs = list(select.find_all(exp.Window))
 
@@ -145,7 +162,7 @@ class AstAnalyzer:
                 source_alias, source_col = self._extract_source_column(expr)
                 is_group_key = expr_sql in group_keys
                 is_aggregated = False
-                if isinstance(expr, exp.Func) and expr.is_aggregate:
+                if isinstance(expr, exp.Func) and getattr(expr, "is_aggregate", False):
                     is_aggregated = True
                 elif expr_sql in agg_expr_sqls:
                     is_aggregated = True
@@ -244,8 +261,7 @@ class AstAnalyzer:
 
         agg_funcs = set()
         for func in root.find_all(exp.Func):
-            if func.is_aggregate:
+            if getattr(func, "is_aggregate", False):
                 agg_funcs.add(func.name.upper())
 
         return has_group_by, has_window, sorted(agg_funcs)
-

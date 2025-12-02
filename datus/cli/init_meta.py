@@ -106,17 +106,17 @@ class TableDefinition:
 
 DW_META_TABLES: tuple[TableDefinition, ...] = (
     TableDefinition(
-        name="view_source",
+        name="table_source",
         columns="""
-view_id        BIGINT NOT NULL AUTO_INCREMENT,
+table_id        BIGINT NOT NULL AUTO_INCREMENT,
 source_system  VARCHAR(64) NOT NULL COMMENT 'ERP/CRM/..',
-view_name      VARCHAR(256) NOT NULL COMMENT '源视图名',
-db_name        VARCHAR(128) NOT NULL COMMENT '所在库名，如 erp',
+table_name      VARCHAR(256) NOT NULL COMMENT '源视图名',
+table_type     VARCHAR(32) NOT NULL COMMENT 'TABLE/VIEW/MATERIALIZED_VIEW',
 ddl_sql        STRING       NOT NULL COMMENT '视图定义SQL',
 hash           VARCHAR(64)  NULL COMMENT 'SQL hash，避免重复处理',
 created_at     DATETIME,
 updated_at     DATETIME,
-PRIMARY KEY (view_id)
+PRIMARY KEY (table_id)
 """,
     ),
     TableDefinition(
