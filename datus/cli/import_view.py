@@ -65,8 +65,8 @@ class ImportViewRunner:
         self.ast = AstAnalyzer(dialect="oracle")
         self.llm: Optional[LLMBaseModel] = None
 
-    def run(self) -> Dict[str, Any]:
-        """执行全流程，返回简单统计。"""
+    def sync_table_and_views(self) -> Dict[str, int]:
+        """仅同步表/视图 DDL 到 table_source，不做 AST。"""
         all_tables = self._load_tables()
         all_views = self._load_views()
         table_existing = self._load_existing_table_source(table_type="TABLE")
@@ -75,11 +75,6 @@ class ImportViewRunner:
         if self.strategy == "overwrite":
             self._cleanup_downstream(list(view_existing.keys()))
 
-        to_process: List[ViewSourceRow] = []
-        reused_views: List[ViewSourceRow] = []
-        new_view_ids: List[int] = []
-
-        # 先同步物理表 DDL 到 table_source
         for tbl in all_tables:
             row = self._normalize_view(tbl)
             key = row.view_name.lower()
@@ -87,7 +82,25 @@ class ImportViewRunner:
             row.view_id = table_id
             table_existing[key] = row
 
-        # 处理视图
+        for view_meta in all_views:
+            row = self._normalize_view(view_meta)
+            key = row.view_name.lower()
+            new_table_id = self._upsert_table_source(row, view_existing.get(key), table_type="VIEW")
+            if new_table_id:
+                row.view_id = new_table_id
+                view_existing[key] = row
+
+        return {"tables": len(all_tables), "views": len(all_views)}
+
+    def analyze_views(self) -> Dict[str, Any]:
+        """解析视图 AST、依赖、标准字段，假设表/视图已同步。"""
+        all_views = self._load_views()
+        view_existing = self._load_existing_view_source()
+
+        to_process: List[ViewSourceRow] = []
+        reused_views: List[ViewSourceRow] = []
+        new_view_ids: List[int] = []
+
         for view_meta in all_views:
             row = self._normalize_view(view_meta)
             key = row.view_name.lower()
@@ -112,8 +125,6 @@ class ImportViewRunner:
             if row.view_id:
                 new_view_ids.append(row.view_id)
 
-        # DAG 排序（仅视图间依赖）
-        view_name_set = {v.view_name.lower() for v in to_process + reused_views}
         view_records = to_process + reused_views
         if not view_records:
             return {"new_views": len(new_view_ids), "processed": 0, "failed": 0, "reused": len(reused_views)}
@@ -176,6 +187,11 @@ class ImportViewRunner:
             self._persist_std_and_feedback(result["row"].view_name, result["row"].db_name, std_items)
 
         return {"new_views": len(new_view_ids), "processed": processed, "failed": failed, "reused": len(reused_views)}
+
+    def run(self) -> Dict[str, Any]:
+        """兼容旧入口：单库同步后直接解析。"""
+        self.sync_table_and_views()
+        return self.analyze_views()
 
     # ---------- 视图与 hash ---------- #
     def _load_views(self) -> List[Dict[str, str]]:
@@ -798,14 +814,45 @@ class ImportViewRunner:
         return ansi_re.sub("", text)
 
 def run_import_view(agent_config: AgentConfig, db_manager: DBManager, args) -> Dict[str, Any]:
-    runner = ImportViewRunner(
-        agent_config=agent_config,
-        db_manager=db_manager,
-        namespace=args.namespace,
-        sourcedb=args.sourcedb,
-        strategy=args.update_strategy,
-    )
-    return runner.run()
+    sourcedb_configs = agent_config.source_db_configs()
+    if not sourcedb_configs:
+        raise ValueError("未配置任何 sourcedb，请检查 agent.yml")
+
+    results: Dict[str, Dict[str, Any]] = {}
+    names = list(sourcedb_configs.keys())
+
+    # 先全量同步表/视图 DDL
+    for name in names:
+        logger.info("开始同步 sourcedb=%s", name)
+        runner = ImportViewRunner(
+            agent_config=agent_config,
+            db_manager=db_manager,
+            namespace=args.namespace,
+            sourcedb=name,
+            strategy=args.update_strategy,
+        )
+        results[name] = {"sync": runner.sync_table_and_views()}
+
+    # 再统一做 AST 解析
+    for name in names:
+        logger.info("开始解析 sourcedb=%s", name)
+        runner = ImportViewRunner(
+            agent_config=agent_config,
+            db_manager=db_manager,
+            namespace=args.namespace,
+            sourcedb=name,
+            strategy=args.update_strategy,
+        )
+        parse_result = runner.analyze_views()
+        results[name]["analyze"] = parse_result
+
+    summary = {
+        "total_new_views": sum(r["analyze"].get("new_views", 0) for r in results.values()),
+        "total_processed": sum(r["analyze"].get("processed", 0) for r in results.values()),
+        "total_failed": sum(r["analyze"].get("failed", 0) for r in results.values()),
+        "total_reused": sum(r["analyze"].get("reused", 0) for r in results.values()),
+    }
+    return {"status": "success", "results": results, "summary": summary}
 
 
 if __name__ == "__main__":

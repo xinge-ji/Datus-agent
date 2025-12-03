@@ -114,7 +114,9 @@ class AstAnalyzer:
 
     def _prepare_select_sql(self, sql_text: str) -> str:
         """从视图 DDL 中提取可解析的 SELECT，并去掉顶层包裹括号。"""
-        ddl_body = self._normalize_commas(sql_text)
+        ddl_body = self._normalize_commas_and_parentheses(sql_text)
+        ddl_body = self._replace_cdiwcs_domain(ddl_body)
+        ddl_body = self._normalize_dblink_spacing(ddl_body)
         ddl_body = ddl_body.strip()
         ddl_body = ddl_body.rstrip(";")
 
@@ -134,9 +136,9 @@ class AstAnalyzer:
                 ddl_body = ddl_body[select_match.start() :].lstrip()
         return ddl_body
 
-    def _normalize_commas(self, sql: str) -> str:
-        """仅替换引号外的中文逗号为英文逗号，避免误改字符串字面量。"""
-        if "，" not in sql:
+    def _normalize_commas_and_parentheses(self, sql: str) -> str:
+        """仅替换引号外的中文逗号和括号为英文逗号和括号，避免误改字符串字面量。"""
+        if "，" not in sql and "（" not in sql and "）" not in sql:
             return sql
 
         result: List[str] = []
@@ -166,6 +168,10 @@ class AstAnalyzer:
             else:
                 if ch == "，" and not in_single and not in_double:
                     result.append(",")
+                elif ch == "（" and not in_single and not in_double:
+                    result.append("(")
+                elif ch == "）" and not in_single and not in_double:
+                    result.append(")")
                 else:
                     result.append(ch)
             i += 1
@@ -206,6 +212,22 @@ class AstAnalyzer:
         """
         pattern = re.compile(r"(?is)nvl\\s*\\(\\s*([A-Za-z_][\\w$#]*)\\s*,\\s*([^)]+?)\\s*\\)\\s+\\1(?![\\w$#])")
         return pattern.sub(r"\\2 AS \\1", sql)
+
+    def _replace_cdiwcs_domain(self, sql: str) -> str:
+        """
+        将 cdiwcs.ly.com 不区分大小写地替换为 iwcs。
+        将 lyerp. 不区分大小写地替换为 erp。
+        """
+        sql = re.sub(r"cdiwcs\.ly\.com", "iwcs", sql, flags=re.IGNORECASE)
+        sql = re.sub(r"lyerp\.", "erp.", sql, flags=re.IGNORECASE)
+        return sql
+
+    def _normalize_dblink_spacing(self, sql: str) -> str:
+        """
+        将跨库/DBLink 表名中的 @ 周围空格去掉，仅处理标识符@标识符的模式，避免误伤邮箱等字符串。
+        """
+        pattern = re.compile(r"(?i)([A-Za-z_][\w$#]*)\s*@\s*([A-Za-z_][\w$#]*)")
+        return pattern.sub(lambda m: f"{m.group(1)}@{m.group(2)}", sql)
 
     def _collect_tables(self, root: exp.Expression) -> List[TableInfo]:
         tables: Dict[str, TableInfo] = {}
@@ -470,82 +492,64 @@ class AstAnalyzer:
 
         analyzer = AstAnalyzer()
         sql = """CREATE VIEW AS
-         select a.receiveid,
-       b.srcdtlno      orderdtlid,
-       d.goodsownid    goodsid,
-       d.goodsname,
-       d.goodstype,
-       d.tradepackname tradepack,
-       e.packname,
-       e.packsize,
-       a.goodsqty,
-       a.lotid,
-       g.lotno,
-       g.validdate,
-       g.proddate,
-       g.approvedocno,
-       g.mah,
-       a.goodsstatusid goodstatus,
-       a.goodsstatusid quanstatus,
-       d.prodarea,
-       d.factname      manufacturer,
-       f.companyname   supplyname,
-       --b.memo remark,
-       case
-         when a.checkmemo is not null and a.unqualifiedmemo is not null then
-          a.checkmemo || ' ' || a.unqualifiedmemo
-         else
-          null
-       end as remark, --仁心红不合格处理反馈
-       h.employeename shr,
-       b.shdate shdate,
-       i.employeename checkman,
-       a.checkdate checkdate,
-       (select min(t2.employeename)
-          from wms_st_io_doc t1, pub_employee t2
-         where t1.comefrom = 1
-           and t1.sourceid = a.receiveid
-           and t1.keepmanid = t2.employeeid) keepman,
-       (select max(t1.keepdate)
-          from wms_st_io_doc t1
-         where t1.comefrom = 1
-           and t1.sourceid = a.receiveid) keepdate,
-       c.warehid,
-       c.goodsownerid,
-       c.operationtype,
-       --decode(c.goodsownerid,9139,1,c.operationtype) operationtype,
-       c.zxcolumn4,
-       b.dhwd        as arrivaltemperature, --到货温度
-       a.invoicecode, --发票代码
-       a.invoiceno, --发票号码
-       to_char(a.invoicedate, 'yyyy-mm-dd') invoicedate --发票时间
-  from wms_receive_dtl     a,
-       wms_in_order_dtl    b,
-       wms_in_order        c,
-       tpl_goods           d,
-       tpl_pub_goods_packs e,
-       tpl_go_company      f,
-       wms_goods_lot       g,
-       pub_employee        h,
-       pub_employee        i
- where a.indtlid = b.indtlid
-   and b.inid = c.inid
-   and a.ownergoodsid = d.ownergoodsid
-   and a.goodspackid = e.goodspackid
-   and c.goodsownerid = f.goodsownerid
-   and c.sourcecompanyid = f.companyid
-   and a.lotid = g.lotid
-   and a.usestatus = 4
-   and b.shrid = h.employeeid
-   and a.checkmanid1 = i.employeeid
-   and (c.goodsownerid <> 10007 or
-       (c.goodsownerid = 10007 and
-       c.zxcolumn4 in
-       (select zxcolumn4
-            from wms_in_order
-           where goodsownerid = 10007
-           group by zxcolumn4
-          having min(usestatus) = 3 and max(usestatus) = 3)))
+         select a.check_time as credate, --任务完成时间
+       a.ssc_picking_carton_id, --IWCS任务明细ID
+       a.wms_inout_id as tradedtlid, --WMS移库细单ID
+       b.inv_owner_id as goodsownerid, --货主ID
+       (select aa.party_name
+          from com_party@cdiwcs.ly.com aa
+         where aa.com_party_type_id = 1
+           and aa.com_party_id = b.inv_owner_id) as goodsownername, --货主名称
+       a.checker as checkerid, --复核人ID
+       c.employeecode as checker, --复核人
+       a.com_goods_id as ownergoodsid, --货主货品ID
+       b.goods_name as goodsname, --货品名称
+       b.english_name as goodsengname, --商品名
+       b.goods_desc as goodstype, --规格
+       (select cc.package_name
+          from com_goods_package@cdiwcs.ly.com cc
+         where cc.com_goods_id = a.com_goods_id
+           and cc.package_type = 'UNIT') as tradepackname, --单位
+       (select dd.party_name
+          from com_party@cdiwcs.ly.com dd
+         where dd.com_party_type_id = 4
+           and dd.com_party_id = b.factory_id) as factname, --生产厂家
+       b.product_location as prodarea, --产地
+       a.com_lot_id as lotid, --批号ID
+       d.lot_no as lotno, --批号
+       a.package_id as ownerpackid, --货主货品包装ID
+       a.package_name as packname, --包装名称
+       a.package_num as packsize, --包装大小
+       a.allocate_qty as goodsqty, --拣货数量
+       f.depot_name, --出库区域
+       decode(a.carton_type,
+              'A',
+              '零散出库',
+              'C',
+              '整箱出库',
+              'P',
+              '托盘出库',
+              0) carton_type, --IWCS任务类型
+       decode(a.carton_type, 'A', 1, 0) as scattercount, --散件条数
+       decode(a.carton_type, 'A', 0, 1) as wholecount, --整件条数
+       decode(a.carton_type, 'A', 0, a.allocate_qty / a.package_num) as wholeqty, --整件件数
+       extract(year from a.check_time) * 12 +
+       extract(month from a.check_time) usermm, --逻辑月
+       extract(day from a.check_time) as useday, --月
+       extract(month from a.check_time) as usemonth, --月
+       extract(year from a.check_time) as useyear --年
+  from ssc_autotoplat_picking@cdiwcs.ly.com a,
+       com_goods@cdiwcs.ly.com              b,
+       sys_userlist                @cdiwcs.ly.com c,
+       com_lot@cdiwcs.ly.com                d,
+       com_stock_pos@cdiwcs.ly.com          e,
+       com_depot@cdiwcs.ly.com              f
+ where a.check_status = 'TRUE'
+   and a.checker = c.userid
+   and a.com_goods_id = b.com_goods_id
+   and a.com_lot_id = d.com_lot_id
+   and a.stock_pos_id = e.stock_pos_id
+   and e.depot_id = f.com_depot_id
         """
         features = analyzer.analyze_view(sql)
         print(features)

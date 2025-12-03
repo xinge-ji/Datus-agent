@@ -136,7 +136,15 @@ agent:
       database: ${STARROCKS_DATABASE}
 
   sourcedb:
-    reporting_mysql:
+    reporting_mysql1:
+      type: mysql
+      host: ${MYSQL_HOST}
+      port: ${MYSQL_PORT}
+      username: ${MYSQL_USERNAME}
+      password: ${MYSQL_PASSWORD}
+      database: ${MYSQL_DATABASE}
+
+    reporting_mysql2:
       type: mysql
       host: ${MYSQL_HOST}
       port: ${MYSQL_PORT}

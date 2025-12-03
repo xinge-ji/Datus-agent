@@ -117,7 +117,6 @@ def create_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     import_view_parser.add_argument("--namespace", type=str, required=True, help="命名空间")
-    import_view_parser.add_argument("--sourcedb", type=str, required=True, help="源库逻辑名")
     import_view_parser.add_argument(
         "--update_strategy",
         type=str,
