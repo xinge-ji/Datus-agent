@@ -1,0 +1,22 @@
+Analyze the following View to determine its Data Warehouse Layer.
+
+**Current View Name**: {{ view_name }}
+
+**View SQL Features**:
+- Group By: {{ feature.has_group_by }}
+- Aggregations: {{ feature.aggregates }}
+- Columns: {{ feature.columns | length }} columns
+
+**Dependencies (Upstream Nodes)**:
+{% for dep in dependencies %}
+- Name: {{ dep.name }}
+  Type: {{ dep.type }}
+  {% if dep.layer %}Known Layer: {{ dep.layer }}{% endif %}
+  {% if dep.node_type %}Node Type: {{ dep.node_type }}{% endif %}
+  {% if dep.ai_description %}AI Desc: {{ dep.ai_description }}{% endif %}
+  {% if dep.feature_json %}Feature JSON (truncated): {{ dep.feature_json }}{% endif %}
+{% endfor %}
+
+**DDL Preview**:
+```sql
+{{ ddl_preview }}

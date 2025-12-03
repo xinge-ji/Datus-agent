@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from datus.configuration.agent_config import AgentConfig
 from datus.models.base import LLMBaseModel
+from datus.tools.llms_tools.classify_layer import classify_view_layer
+from rich.prompt import Prompt
 from datus.tools.db_tools.db_manager import DBManager
 from datus.utils.ast_analyzer import AstAnalyzer
 from datus.utils.constants import DBType
@@ -182,16 +184,195 @@ class ImportViewRunner:
         dep_graph = self._build_view_dep_graph(analysis_results)
         topo = self._topo_sort(dep_graph)
         analysis_map = {r["row"].view_name.lower(): r for r in analysis_results}
+
+        # 预取依赖的 node 信息，供 AI/人工判断使用
+        dep_nodes_info = self._load_dep_nodes_info(analysis_results)
+        # 预取依赖的 feature_json（若有历史）
+        dep_features_cache = self._load_dep_features(list(dep_nodes_info.keys()))
+
+        # LLM 延迟初始化
+        if self.llm is None:
+            try:
+                self.llm = LLMBaseModel.create_model(model_name="default", agent_config=self.agent_config)
+            except Exception as exc:  # pragma: no cover
+                logger.warning(f"初始化 LLM 失败，将跳过 AI 分层建议: {exc}")
+                self.llm = None
+
+        print("\n" + "=" * 50)
+        print("开始 AI 辅助数仓分层确认")
+        print("=" * 50 + "\n")
+
+        # 缓存本轮人工确认的层级，供下游视图参考
+        node_layer_cache: Dict[str, str] = {}
+
         for view_name in topo:
             result = analysis_map.get(view_name)
             if not result:
                 continue
-            std_items = self._prepare_std_items(
-                result["feature"], result["alias_map"], result["row"].view_name, result["row"].db_name
+            row = result["row"]
+            feature = result["feature"]
+
+            dependencies_ctx = self._build_dependencies_ctx(
+                feature,
+                dep_nodes_info,
+                dep_features_cache,
+                node_layer_cache,
             )
-            self._persist_std_and_feedback(result["row"].view_name, result["row"].db_name, std_items)
+
+            ai_result = {"layer": "OTHER", "description": "", "confidence": 0.0}
+            if self.llm:
+                print(f" 正在分析视图: [cyan]{row.view_name}[/cyan] ...")
+                ai_result = classify_view_layer(
+                    model=self.llm,
+                    view_name=row.view_name,
+                    feature=feature,
+                    dependencies=dependencies_ctx,
+                    ddl_sql=row.ddl_sql,
+                )
+
+            print(f"\n视图: [bold]{row.view_name}[/bold]")
+            dep_names = ", ".join([d.get("name") for d in dependencies_ctx]) if dependencies_ctx else "无"
+            print(f"依赖: {dep_names}")
+            print(
+                f"AI 建议: [green]{ai_result.get('layer', 'OTHER')}[/green] "
+                f"(置信度: {ai_result.get('confidence', 0.0)})"
+            )
+            print(f"AI 描述: {ai_result.get('description', '')}")
+
+            human_layer = self._interactive_confirm_layer(row.view_name, ai_result.get("layer", "OTHER"))
+            node_layer_cache[view_name] = human_layer
+
+            self._update_dw_node_layer_info(
+                view_id=row.view_id,
+                ai_suggest=ai_result.get("layer", "OTHER"),
+                ai_desc=ai_result.get("description", ""),
+                ai_conf=ai_result.get("confidence", 0.0),
+                human_final=human_layer,
+            )
+
+            std_items = self._prepare_std_items(
+                feature,
+                result["alias_map"],
+                row.view_name,
+                row.db_name,
+            )
+            self._persist_std_and_feedback(row.view_name, row.db_name, std_items)
 
         return {"new_views": len(new_view_ids), "processed": processed, "failed": failed, "reused": len(reused_views)}
+
+    def _build_dependencies_ctx(
+        self,
+        feature: Dict[str, Any],
+        dep_nodes_info: Dict[str, Dict[str, Any]],
+        dep_features_cache: Dict[str, str],
+        node_layer_cache: Dict[str, str],
+    ) -> List[Dict[str, Any]]:
+        """构建 AI 所需的依赖上下文。"""
+        deps = (feature.get("view_dependencies") or []) + (feature.get("table_dependencies") or [])
+        ctx: List[Dict[str, Any]] = []
+        for dep_name in deps:
+            dep_key = dep_name.lower()
+            node_info = dep_nodes_info.get(dep_key, {})
+            known_layer = (
+                node_layer_cache.get(dep_key)
+                or node_info.get("human_layer_final")
+                or node_info.get("ai_layer_suggest")
+                or "UNKNOWN"
+            )
+
+            ctx_item: Dict[str, Any] = {
+                "name": dep_name,
+                "type": node_info.get("node_type")
+                or ("VIEW" if dep_name in (feature.get("view_dependencies") or []) else "TABLE"),
+                "layer": known_layer,
+                "node_type": node_info.get("node_type") or "UNKNOWN",
+                "ai_description": node_info.get("ai_description") or "",
+            }
+
+            feat_raw = dep_features_cache.get(dep_key)
+            if feat_raw:
+                # 避免 prompt 过长，截断到 3000 字符
+                ctx_item["feature_json"] = feat_raw[:3000]
+
+            ctx.append(ctx_item)
+
+        return ctx
+
+    def _interactive_confirm_layer(self, view_name: str, ai_suggest: str) -> str:
+        choices = ["DIM", "DWD", "DWS", "OTHER"]
+        default_choice = ai_suggest if ai_suggest in choices else "OTHER"
+        prompt_text = f"请确认 [cyan]{view_name}[/cyan] 的数仓层级"
+        user_input = Prompt.ask(prompt_text, choices=choices, default=default_choice, show_choices=True)
+        return user_input
+
+    def _update_dw_node_layer_info(
+        self, view_id: int, ai_suggest: str, ai_desc: str, ai_conf: float, human_final: str
+    ):
+        if not view_id:
+            return
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        ai_desc_esc = self._escape(ai_desc)
+        sql = (
+            "UPDATE dw_meta.dw_node SET "
+            f"ai_layer_suggest = '{ai_suggest}', "
+            f"ai_description = '{ai_desc_esc}', "
+            f"ai_confidence = {ai_conf}, "
+            f"human_layer_final = '{human_final}', "
+            "migration_status = 'REVIEWED', "
+            f"updated_at = '{now}' "
+            f"WHERE source_table_id = {view_id}"
+        )
+        try:
+            self.meta_conn.execute({"sql_query": sql})
+        except Exception as e:  # pragma: no cover
+            logger.error(f"更新节点层级信息失败 ID={view_id}: {e}")
+
+    def _load_dep_nodes_info(self, analysis_results: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        """批量查询依赖的 dw_node 信息（node_type/human_layer_final/ai_description/ai_layer_suggest）。"""
+        dep_names: Set[str] = set()
+        for r in analysis_results:
+            feature = r.get("feature") or {}
+            dep_names.update([d.lower() for d in feature.get("view_dependencies") or []])
+            dep_names.update([d.lower() for d in feature.get("table_dependencies") or []])
+        if not dep_names:
+            return {}
+        names_sql = ",".join(f"'{self._escape(n)}'" for n in dep_names)
+        sql = (
+            "SELECT table_name, node_type, human_layer_final, ai_description, ai_layer_suggest "
+            "FROM dw_meta.dw_node "
+            f"WHERE source_system = '{self._escape(self.sourcedb)}' AND table_name IN ({names_sql})"
+        )
+        res = self.meta_conn.execute({"sql_query": sql, "result_format": "list"})
+        rows = self._rows_from_result(res)
+        info: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            key = str(row.get("table_name") or "").lower()
+            info[key] = {
+                "node_type": (row.get("node_type") or "").upper(),
+                "human_layer_final": row.get("human_layer_final") or "",
+                "ai_description": row.get("ai_description") or "",
+                "ai_layer_suggest": row.get("ai_layer_suggest") or "",
+            }
+        return info
+
+    def _load_dep_features(self, dep_keys: List[str]) -> Dict[str, str]:
+        """批量获取依赖节点的 feature_json（如存在）。"""
+        if not dep_keys:
+            return {}
+        names_sql = ",".join(f"'{self._escape(n)}'" for n in dep_keys)
+        sql = (
+            "SELECT ts.table_name, af.feature_json "
+            "FROM dw_meta.table_source ts "
+            "JOIN dw_meta.ai_view_feature af ON ts.table_id = af.table_id "
+            f"WHERE ts.source_system = '{self._escape(self.sourcedb)}' AND ts.table_name IN ({names_sql})"
+        )
+        res = self.meta_conn.execute({"sql_query": sql, "result_format": "list"})
+        rows = self._rows_from_result(res)
+        cache: Dict[str, str] = {}
+        for row in rows:
+            key = str(row.get("table_name") or "").lower()
+            cache[key] = row.get("feature_json") or ""
+        return cache
 
     def run(self) -> Dict[str, Any]:
         """兼容旧入口：单库同步后直接解析。"""
