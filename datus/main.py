@@ -124,6 +124,13 @@ def create_parser() -> argparse.ArgumentParser:
         default="incremental",
         help="更新策略：overwrite 全量重算，incremental 增量+重算 DAG/AST",
     )
+    import_view_parser.add_argument(
+        "--step",
+        type=str,
+        choices=["all", "import", "analyze", "classify", "naming"],
+        default="all",
+        help="执行步骤：import(仅导入DDL), analyze(仅AST分析), classify(AI分层确认), naming(标准化字段命名), all(全流程)",
+    )
 
     # bootstrap-kb command
     bootstrap_parser = subparsers.add_parser(

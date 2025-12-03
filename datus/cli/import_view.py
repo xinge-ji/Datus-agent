@@ -35,12 +35,15 @@ class ViewSourceRow:
 class ImportViewRunner:
     """视图导入与AST分析执行器。"""
 
-    def __init__(self, agent_config: AgentConfig, db_manager: DBManager, namespace: str, sourcedb: str, strategy: str):
+    def __init__(
+        self, agent_config: AgentConfig, db_manager: DBManager, namespace: str, sourcedb: str, strategy: str, step: str = "all"
+    ):
         self.agent_config = agent_config
         self.db_manager = db_manager
         self.namespace = namespace
         self.sourcedb = sourcedb
         self.strategy = strategy
+        self.step = step
         # 源库连接：优先从 sourcedb 配置创建独立连接，否则使用 namespace 下的逻辑库
         src_db_config = None
         try:
@@ -72,8 +75,26 @@ class ImportViewRunner:
             "lywms": "wms",
         }
 
-    def sync_table_and_views(self) -> Dict[str, int]:
-        """仅同步表/视图 DDL 到 table_source，不做 AST。"""
+    def run(self) -> Dict[str, Any]:
+        """根据 step 参数调度执行。"""
+        stats: Dict[str, Any] = {"step": self.step, "details": {}}
+
+        if self.step in {"all", "import"}:
+            stats["details"]["import"] = self.run_import_ddl()
+
+        if self.step in {"all", "analyze"}:
+            stats["details"]["analyze"] = self.run_ast_analysis()
+
+        if self.step in {"all", "classify"}:
+            stats["details"]["classify"] = self.run_layer_classification()
+
+        if self.step in {"all", "naming"}:
+            stats["details"]["naming"] = self.run_naming()
+
+        return stats
+
+    def run_import_ddl(self) -> Dict[str, int]:
+        """阶段1：导入表/视图 DDL。"""
         all_tables = self._load_tables()
         all_views = self._load_views()
         table_existing = self._load_existing_table_source(table_type="TABLE")
@@ -82,22 +103,248 @@ class ImportViewRunner:
         if self.strategy == "overwrite":
             self._cleanup_downstream(list(view_existing.keys()))
 
+        added = updated = skipped = 0
+
         for tbl in all_tables:
             row = self._normalize_view(tbl)
             key = row.view_name.lower()
-            table_id = self._upsert_table_source(row, table_existing.get(key), table_type="TABLE")
+            existing = table_existing.get(key)
+            table_id, changed = self._upsert_table_source(row, existing, table_type="TABLE")
             row.view_id = table_id
             table_existing[key] = row
+            if existing:
+                if changed:
+                    updated += 1
+                else:
+                    skipped += 1
+            else:
+                added += 1
 
         for view_meta in all_views:
             row = self._normalize_view(view_meta)
             key = row.view_name.lower()
-            new_table_id = self._upsert_table_source(row, view_existing.get(key), table_type="VIEW")
-            if new_table_id:
-                row.view_id = new_table_id
-                view_existing[key] = row
+            existing = view_existing.get(key)
+            view_id, changed = self._upsert_table_source(row, existing, table_type="VIEW")
+            row.view_id = view_id
+            view_existing[key] = row
+            if existing:
+                if changed:
+                    updated += 1
+                else:
+                    skipped += 1
+            else:
+                added += 1
 
-        return {"tables": len(all_tables), "views": len(all_views)}
+        logger.info(f"DDL 导入完成: 新增 {added}, 更新 {updated}, 跳过 {skipped}")
+        return {"added": added, "updated": updated, "skipped": skipped}
+
+    def run_ast_analysis(self) -> Dict[str, int]:
+        """阶段2：AST 分析与血缘落库。"""
+        logger.info(">>> 阶段 2: 开始 AST 分析 ...")
+        views_to_process = self._load_views_from_meta_for_analysis()
+        if not views_to_process:
+            return {"success": 0, "failed": 0, "skipped": 0}
+
+        table_source_map = self._load_table_source_map()
+        success = failed = skipped = 0
+
+        for row in views_to_process:
+            view_id = row.get("view_id")
+            view_name = row.get("view_name") or ""
+            ddl_sql = row.get("ddl_sql") or ""
+            parse_status = (row.get("parse_status") or "").upper()
+            current_hash = row.get("hash") or ""
+            prev_hash = self._get_feature_hash(view_id)
+
+            if (
+                self.strategy == "incremental"
+                and parse_status == "PARSED"
+                and prev_hash
+                and prev_hash == current_hash
+            ):
+                skipped += 1
+                continue
+
+            try:
+                feature = self.ast.analyze_view(ddl_sql, view_name)
+                deps = self._resolve_dependencies(feature, table_source_map, row.get("db_name") or self.sourcedb)
+                feature["status"] = "OK"
+                feature["source_hash"] = current_hash
+                feature["view_dependencies"] = sorted(deps["view_dependencies"])
+                feature["table_dependencies"] = sorted(deps["table_dependencies"])
+                feature["unresolved_dependencies"] = sorted(deps["unresolved"])
+
+                feature_json = json.dumps(feature, ensure_ascii=True)
+                self._upsert_ai_view_feature(view_id, feature_json)
+                self._update_table_parse_status(view_id, "PARSED")
+                self._update_node_migration_status(view_id, "ANALYZED")
+
+                view_node_id = self._ensure_view_node(view_id, view_name)
+                dependency_nodes = self._ensure_dependency_nodes(deps["dep_info"])
+                self._upsert_relations(view_node_id, dependency_nodes, feature, deps["dep_info"])
+                success += 1
+            except Exception as exc:  # pragma: no cover
+                logger.error(f"视图 {view_name} 解析失败: {exc}")
+                error_json = json.dumps({"status": "ERROR", "error": str(exc)}, ensure_ascii=True)
+                self._upsert_ai_view_feature(view_id, error_json)
+                self._update_table_parse_status(view_id, "FAILED")
+                self._update_node_migration_status(view_id, "AST_FAILED")
+                failed += 1
+
+        logger.info(f"AST 分析完成: 成功 {success}, 失败 {failed}, 跳过 {skipped}")
+        return {"success": success, "failed": failed, "skipped": skipped}
+
+    def run_layer_classification(self) -> Dict[str, int]:
+        """阶段3：AI 分层 + 人工确认。"""
+        logger.info(">>> 阶段 3: 开始 AI 分层确认 ...")
+
+        if self.llm is None:
+            try:
+                self.llm = LLMBaseModel.create_model(model_name="default", agent_config=self.agent_config)
+            except Exception as exc:
+                logger.warning(f"LLM 初始化失败: {exc}")
+                return {"error": "LLM init failed"}
+
+        nodes_data = self._load_nodes_for_classification()
+        if not nodes_data:
+            return {"processed": 0, "skipped": 0}
+
+        dep_graph = self._build_graph_from_nodes(nodes_data)
+        topo_order = self._topo_sort(dep_graph)
+        nodes_map = {n["view_name"].lower(): n for n in nodes_data}
+
+        layer_cache = {n["view_name"].lower(): n["human_layer_final"] for n in nodes_data if n.get("human_layer_final")}
+        processed = skipped = 0
+
+        for view_name_lower in topo_order:
+            node = nodes_map.get(view_name_lower)
+            if not node:
+                continue
+
+            if (
+                self.strategy == "incremental"
+                and node.get("migration_status") in ["REVIEWED", "IMPLEMENTED"]
+            ):
+                skipped += 1
+                continue
+
+            view_name = node["view_name"]
+            view_id = node["source_table_id"]
+            feature = json.loads(node["feature_json"]) if node.get("feature_json") else {}
+
+            dependencies_ctx = self._build_dependencies_ctx(
+                feature,
+                {},
+                {},
+                layer_cache,
+            )
+
+            print(f"\n 正在分析视图: [cyan]{view_name}[/cyan] ...")
+            ai_result = classify_view_layer(
+                model=self.llm,
+                view_name=view_name,
+                feature=feature,
+                dependencies=dependencies_ctx,
+                ddl_sql=node.get("ddl_sql", ""),
+            )
+
+            print(f"\n视图: [bold]{view_name}[/bold]")
+            dep_names = ", ".join([d.get("name") for d in dependencies_ctx]) if dependencies_ctx else "无"
+            print(f"依赖: {dep_names}")
+            print(
+                f"AI 建议: [green]{ai_result.get('layer', 'OTHER')}[/green] "
+                f"(置信度: {ai_result.get('confidence', 0.0)})"
+            )
+            print(f"AI 描述: {ai_result.get('description', '')}")
+
+            human_layer = self._interactive_confirm_layer(view_name, ai_result.get("layer", "OTHER"))
+            layer_cache[view_name_lower] = human_layer
+
+            self._update_dw_node_layer_info(
+                view_id=view_id,
+                ai_suggest=ai_result.get("layer", "OTHER"),
+                ai_desc=ai_result.get("description", ""),
+                ai_conf=ai_result.get("confidence", 0.0),
+                human_final=human_layer,
+            )
+            processed += 1
+
+        logger.info(f"分层确认完成: 已处理 {processed}, 跳过 {skipped}")
+        return {"processed": processed, "skipped": skipped}
+
+    def run_naming(self) -> Dict[str, int]:
+        """阶段4：AI+人工确认标准化字段命名。"""
+        logger.info(">>> 阶段 4: 开始字段命名 ...")
+        if self.llm is None:
+            try:
+                self.llm = LLMBaseModel.create_model(model_name="default", agent_config=self.agent_config)
+            except Exception as exc:
+                logger.warning(f"LLM 初始化失败: {exc}")
+                return {"error": "LLM init failed"}
+
+        views = self._load_views_for_naming()
+        if not views:
+            return {"processed": 0, "skipped": 0, "mapped": 0}
+
+        processed = skipped = mapped = 0
+        existing_std_names = self._load_existing_std_names()
+
+        for row in views:
+            view_name = row.get("view_name") or ""
+            view_hash = row.get("hash") or ""
+            feature_json = row.get("feature_json") or ""
+            feature = json.loads(feature_json) if feature_json else {}
+
+            if not feature.get("columns"):
+                logger.info(f"视图 {view_name} 缺少字段信息，跳过命名")
+                skipped += 1
+                continue
+
+            if self.strategy == "incremental":
+                has_mapping = self._has_existing_mapping(view_name)
+                feature_hash = feature.get("source_hash")
+                if has_mapping and feature_hash and feature_hash == view_hash:
+                    skipped += 1
+                    continue
+
+            if self.strategy == "overwrite":
+                self._delete_std_mapping(view_name)
+
+            alias_map = {(t.get("alias") or t.get("resolved_name") or t.get("name")): t for t in feature.get("tables", [])}
+
+            for col in feature.get("columns") or []:
+                std_en, std_cn = self._suggest_std_field_names(
+                    view_name=view_name,
+                    column=col,
+                    banned_names=existing_std_names,
+                )
+                std_en, std_cn = self._interactive_confirm_naming(view_name, col.get("output_name") or col.get("source_column") or "", std_en, std_cn)
+                existing_std_names.add(std_en)
+                std_id = self._get_or_create_std_field(
+                    {
+                        "std_field_name": std_en,
+                        "std_field_name_cn": std_cn,
+                        "data_type_std": "string",
+                    }
+                )
+                source_alias = col.get("source_table_alias")
+                source_table = view_name
+                if source_alias and source_alias in alias_map:
+                    table_meta = alias_map[source_alias]
+                    source_table = table_meta.get("resolved_name") or table_meta.get("name") or view_name
+                item = {
+                    "source_db": row.get("db_name") or self.sourcedb,
+                    "source_table": source_table,
+                    "source_column": col.get("source_column") or (col.get("output_name") or ""),
+                    "expression_sql": col.get("expression_sql") or "",
+                }
+                self._upsert_std_mapping(std_id, item)
+                mapped += 1
+
+            processed += 1
+
+        logger.info(f"字段命名完成: 已处理视图 {processed}, 跳过 {skipped}, 新增/更新映射 {mapped}")
+        return {"processed": processed, "skipped": skipped, "mapped": mapped}
 
     def analyze_views(self) -> Dict[str, Any]:
         """解析视图 AST、依赖、标准字段，假设表/视图已同步。"""
@@ -111,7 +358,7 @@ class ImportViewRunner:
         for view_meta in all_views:
             row = self._normalize_view(view_meta)
             key = row.view_name.lower()
-            new_table_id = self._upsert_table_source(row, view_existing.get(key), table_type="VIEW")
+            new_table_id, _ = self._upsert_table_source(row, view_existing.get(key), table_type="VIEW")
             if new_table_id:
                 row.view_id = new_table_id
                 view_existing[key] = row
@@ -480,13 +727,30 @@ class ImportViewRunner:
 
     def _upsert_table_source(
         self, row: ViewSourceRow, existing: Optional[ViewSourceRow], table_type: str = "VIEW"
-    ) -> int:
-        if existing and existing.sql_hash == row.sql_hash:
-            return existing.view_id or 0
+    ) -> Tuple[int, bool]:
+        """
+        返回 (table_id, changed)，changed 表示是否发生了插入/更新。
+        """
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         view_name = self._escape(row.view_name)
         ddl_sql = self._escape(row.ddl_sql)
         sql_hash = self._escape(row.sql_hash)
+
+        # 已存在且 hash 未变
+        if existing and existing.sql_hash == row.sql_hash:
+            return existing.view_id or 0, False
+
+        # 已存在但 hash 变化 -> 更新
+        if existing and existing.view_id:
+            update_sql = (
+                "UPDATE dw_meta.table_source SET "
+                f"ddl_sql = '{ddl_sql}', hash = '{sql_hash}', updated_at = '{now}' "
+                f"WHERE table_id = {existing.view_id}"
+            )
+            self.meta_conn.execute({"sql_query": update_sql})
+            return existing.view_id, True
+
+        # 新增
         insert = (
             "INSERT INTO dw_meta.table_source "
             "(source_system, table_name, table_type, ddl_sql, hash, created_at, updated_at) "
@@ -503,7 +767,7 @@ class ImportViewRunner:
             }
         )
         rows = self._rows_from_result(res)
-        return int(rows[0].get("table_id")) if rows else 0
+        return (int(rows[0].get("table_id")), True) if rows else (0, True)
 
     def _cleanup_downstream(self, view_names: List[str]):
         if not view_names:
@@ -605,7 +869,7 @@ class ImportViewRunner:
                 ddl_sql="-- Virtual table created by dependency resolution",
                 sql_hash="virtual",
             )
-            new_id = self._upsert_table_source(virtual_row, None, table_type="EXTERNAL")
+            new_id, _ = self._upsert_table_source(virtual_row, None, table_type="EXTERNAL")
             return {
                 "table_id": new_id,
                 "table_type": "EXTERNAL",
@@ -706,6 +970,148 @@ class ImportViewRunner:
             if v.view_name.lower() == view_name:
                 return v
         return None
+
+    # ---------- 新增阶段辅助 ---------- #
+    def _load_views_from_meta_for_analysis(self) -> List[Dict[str, Any]]:
+        sql = (
+            "SELECT table_id as view_id, table_name as view_name, ddl_sql, parse_status, hash "
+            "FROM dw_meta.table_source "
+            f"WHERE source_system = '{self.sourcedb}' AND table_type = 'VIEW'"
+        )
+        res = self.meta_conn.execute({"sql_query": sql, "result_format": "list"})
+        return self._rows_from_result(res)
+
+    def _load_nodes_for_classification(self) -> List[Dict[str, Any]]:
+        sql = (
+            "SELECT n.node_id, n.table_name as view_name, n.source_table_id, "
+            "n.human_layer_final, n.migration_status, "
+            "f.feature_json, t.ddl_sql "
+            "FROM dw_meta.dw_node n "
+            "LEFT JOIN dw_meta.ai_view_feature f ON n.source_table_id = f.table_id "
+            "LEFT JOIN dw_meta.table_source t ON n.source_table_id = t.table_id "
+            f"WHERE n.source_system = '{self.sourcedb}' AND n.node_type = 'VIEW'"
+        )
+        res = self.meta_conn.execute({"sql_query": sql, "result_format": "list"})
+        return self._rows_from_result(res)
+
+    def _build_graph_from_nodes(self, nodes: List[Dict[str, Any]]) -> Dict[str, Set[str]]:
+        graph: Dict[str, Set[str]] = {}
+        for n in nodes:
+            name = n["view_name"].lower()
+            feature = json.loads(n["feature_json"]) if n.get("feature_json") else {}
+            deps = set([d.lower() for d in feature.get("view_dependencies", [])])
+            graph[name] = deps
+        return graph
+
+    def _get_feature_hash(self, view_id: Optional[int]) -> str:
+        if not view_id:
+            return ""
+        res = self.meta_conn.execute(
+            {"sql_query": f"SELECT feature_json FROM dw_meta.ai_view_feature WHERE table_id = {view_id} LIMIT 1"}
+        )
+        rows = self._rows_from_result(res)
+        if not rows:
+            return ""
+        try:
+            feature = json.loads(rows[0].get("feature_json") or "{}")
+            return feature.get("source_hash") or ""
+        except Exception:
+            return ""
+
+    def _load_views_for_naming(self) -> List[Dict[str, Any]]:
+        sql = (
+            "SELECT ts.table_id as view_id, ts.table_name as view_name, ts.ddl_sql, ts.hash, "
+            "'' as db_name, af.feature_json "
+            "FROM dw_meta.table_source ts "
+            "LEFT JOIN dw_meta.ai_view_feature af ON ts.table_id = af.table_id "
+            f"WHERE ts.source_system = '{self.sourcedb}' AND ts.table_type = 'VIEW'"
+        )
+        res = self.meta_conn.execute({"sql_query": sql, "result_format": "list"})
+        return self._rows_from_result(res)
+
+    def _has_existing_mapping(self, view_name: str) -> bool:
+        sql = (
+            "SELECT COUNT(1) as cnt FROM dw_meta.std_field_mapping "
+            f"WHERE source_system = '{self._escape(self.sourcedb)}' "
+            f"AND source_table = '{self._escape(view_name)}'"
+        )
+        res = self.meta_conn.execute({"sql_query": sql, "result_format": "list"})
+        rows = self._rows_from_result(res)
+        if not rows:
+            return False
+        try:
+            return int(rows[0].get("cnt") or 0) > 0
+        except Exception:
+            return False
+
+    def _delete_std_mapping(self, view_name: str):
+        sql = (
+            "DELETE FROM dw_meta.std_field_mapping "
+            f"WHERE source_system = '{self._escape(self.sourcedb)}' "
+            f"AND source_table = '{self._escape(view_name)}'"
+        )
+        self.meta_conn.execute({"sql_query": sql})
+
+    def _load_existing_std_names(self) -> Set[str]:
+        res = self.meta_conn.execute({"sql_query": "SELECT std_field_name FROM dw_meta.std_field"})
+        rows = self._rows_from_result(res)
+        return {str(r.get("std_field_name")).lower() for r in rows if r.get("std_field_name")}
+
+    def _suggest_std_field_names(self, view_name: str, column: Dict[str, Any], banned_names: Set[str]) -> Tuple[str, str]:
+        base_en = self._to_snake(column.get("output_name") or column.get("source_column") or "")
+        base_cn = column.get("output_name") or column.get("source_column") or ""
+        if not self.llm:
+            return base_en, base_cn
+
+        prompt = (
+            "你是数仓标准字段命名助手，请根据字段含义给出英文蛇形命名和中文命名。\n"
+            f"视图: {view_name}\n"
+            f"字段: {column}\n"
+            f"禁止使用的英文名: {', '.join(list(banned_names)[:20])}\n"
+            "输出 JSON，键为 std_field_name, std_field_name_cn，不要包含多余文本。"
+        )
+
+        for _ in range(3):
+            resp = self.llm.generate(prompt)
+            parsed = self._extract_json_dict(resp)
+            std_en = self._to_snake(parsed.get("std_field_name") or base_en)
+            std_cn = parsed.get("std_field_name_cn") or base_cn
+            if std_en and std_en not in banned_names:
+                return std_en, std_cn
+            prompt += f"\n请重新生成，避免使用: {std_en}"
+        return base_en, base_cn
+
+    def _interactive_confirm_naming(self, view_name: str, source_column: str, suggest_en: str, suggest_cn: str) -> Tuple[str, str]:
+        prompt_text = (
+            f"确认字段命名 {view_name}.{source_column}\n"
+            f"默认英文: {suggest_en}, 默认中文: {suggest_cn}\n"
+            "如需修改，请输入 英文,中文（逗号分隔），直接回车接受默认: "
+        )
+        try:
+            user_input = input(prompt_text)
+        except Exception:
+            return suggest_en, suggest_cn
+        if not user_input:
+            return suggest_en, suggest_cn
+        parts = [p.strip() for p in user_input.split(",") if p.strip()]
+        if len(parts) == 1:
+            return self._to_snake(parts[0]), suggest_cn
+        if len(parts) >= 2:
+            return self._to_snake(parts[0]), parts[1]
+        return suggest_en, suggest_cn
+
+    def _extract_json_dict(self, text: str) -> Dict[str, Any]:
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+        if "{" in text and "}" in text:
+            try:
+                raw = text[text.index("{") : text.rindex("}") + 1]
+                return json.loads(raw)
+            except Exception:
+                return {}
+        return {}
 
     # ---------- AST 落库 ---------- #
     def _upsert_ai_view_feature(self, table_id: int, feature_json: str):
@@ -1082,38 +1488,19 @@ def run_import_view(agent_config: AgentConfig, db_manager: DBManager, args) -> D
     results: Dict[str, Dict[str, Any]] = {}
     names = list(sourcedb_configs.keys())
 
-    # 先全量同步表/视图 DDL
     for name in names:
-        logger.info(f"开始同步 sourcedb={name}")
+        logger.info(f"开始执行 import-view，sourcedb={name}，step={getattr(args, 'step', 'all')}")
         runner = ImportViewRunner(
             agent_config=agent_config,
             db_manager=db_manager,
             namespace=args.namespace,
             sourcedb=name,
             strategy=args.update_strategy,
+            step=getattr(args, "step", "all"),
         )
-        results[name] = {"sync": runner.sync_table_and_views()}
+        results[name] = runner.run()
 
-    # 再统一做 AST 解析
-    for name in names:
-        logger.info(f"开始解析 sourcedb={name}")
-        runner = ImportViewRunner(
-            agent_config=agent_config,
-            db_manager=db_manager,
-            namespace=args.namespace,
-            sourcedb=name,
-            strategy=args.update_strategy,
-        )
-        parse_result = runner.analyze_views()
-        results[name]["analyze"] = parse_result
-
-    summary = {
-        "total_new_views": sum(r["analyze"].get("new_views", 0) for r in results.values()),
-        "total_processed": sum(r["analyze"].get("processed", 0) for r in results.values()),
-        "total_failed": sum(r["analyze"].get("failed", 0) for r in results.values()),
-        "total_reused": sum(r["analyze"].get("reused", 0) for r in results.values()),
-    }
-    return {"status": "success", "results": results, "summary": summary}
+    return {"status": "success", "results": results}
 
 
 if __name__ == "__main__":
