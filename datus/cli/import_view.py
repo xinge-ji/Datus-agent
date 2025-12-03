@@ -129,10 +129,7 @@ class ImportViewRunner:
             try:
                 ddl_sql = row.ddl_sql or ""
                 logger.debug(f"待解析视图 {row.view_name} DDL: {ddl_sql}")
-                parsed_sql = self._strip_create_view(ddl_sql)
-                parsed_sql = self._strip_to_first_statement(parsed_sql)
-                parsed_sql = self._strip_oracle_plus(parsed_sql)
-                feature = self.ast.analyze_view(parsed_sql, row.view_name)
+                feature = self.ast.analyze_view(ddl_sql, row.view_name)
                 deps = self._resolve_dependencies(feature, table_source_map, row.db_name)
                 if deps["unresolved"]:
                     logger.warning("视图 %s 依赖未解析: %s", row.view_name, deps["unresolved"])
@@ -762,28 +759,9 @@ class ImportViewRunner:
                 return []
         return []
 
-    def _strip_create_view(self, ddl_sql: str) -> str:
-        text = ddl_sql.strip().rstrip(";")
-        pattern = re.compile(r"create\s+(or\s+replace\s+)?(force\s+)?view\s+.+?\bas\b", re.IGNORECASE | re.DOTALL)
-        m = pattern.search(text)
-        if m:
-            return text[m.end() :].strip()
-        return text
-
-    def _strip_to_first_statement(self, ddl_sql: str) -> str:
-        pattern = re.compile(r"\b(select|with|insert)\b", re.IGNORECASE)
-        m = pattern.search(ddl_sql)
-        if m:
-            return ddl_sql[m.start() :].strip()
-        return ddl_sql.strip()
-
     def _strip_ansi(self, text: str) -> str:
         ansi_re = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]", re.IGNORECASE)
         return ansi_re.sub("", text)
-
-    def _strip_oracle_plus(self, text: str) -> str:
-        plus_re = re.compile(r"\(\+\)", re.IGNORECASE)
-        return plus_re.sub("", text)
 
 def run_import_view(agent_config: AgentConfig, db_manager: DBManager, args) -> Dict[str, Any]:
     runner = ImportViewRunner(

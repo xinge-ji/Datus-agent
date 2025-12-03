@@ -93,10 +93,9 @@ class AstAnalyzer:
             except Exception as mysql_exc:
                 raise ValueError(
                     f"Failed to parse SQL for view {view_name or ''} with both {self.dialect} and MySQL dialects. "
-                    f"Oracle error: {oracle_exc}. MySQL error: {mysql_exc}"
+                    f"SQL: {select_sql}"
                 ) from mysql_exc
 
-        root = self._normalize_nullable(root)
         tables = self._collect_tables(root)
         columns = self._collect_columns(root)
         joins = self._collect_joins(root)
@@ -124,6 +123,13 @@ class AstAnalyzer:
 
         ddl_body = ddl_body.strip()
         ddl_body = self._strip_outer_select_parentheses(ddl_body)
+        ddl_body = self._rewrite_nvl_new_column(ddl_body)
+
+        # 如果前缀被误切掉，尝试定位第一个 SELECT 重新对齐（保留 WITH 开头的场景）。
+        if not re.match(r"(?is)^(select|with)\b", ddl_body):
+            select_match = re.search(r"(?is)\bselect\b", ddl_body)
+            if select_match:
+                ddl_body = ddl_body[select_match.start() :].lstrip()
         return ddl_body
 
     def _strip_outer_select_parentheses(self, sql: str) -> str:
@@ -142,56 +148,19 @@ class AstAnalyzer:
                     return trimmed
 
         inner = trimmed[1:-1].strip()
-        if re.match(r"(?is)^select\\b", inner):
+        if re.match(r"(?is)^select\b", inner):
             return inner
         return trimmed
 
-    def _normalize_nullable(self, root: exp.Expression) -> exp.Expression:
-        """仅在列列表中将非别名的 NULLABLE 字段引用替换为 NULL。"""
-        for select in root.find_all(exp.Select):
-            new_exprs: List[exp.Expression] = []
-            for proj in select.expressions:
-                if isinstance(proj, exp.Alias):
-                    normalized = self._replace_nullable_column(proj.this)
-                    proj.set("this", normalized)
-                    new_exprs.append(proj)
-                    continue
-
-                should_alias_nullable = isinstance(proj, exp.Column) and self._should_replace_nullable_column(proj)
-                normalized = self._replace_nullable_column(proj)
-                if should_alias_nullable and not proj.alias:
-                    new_exprs.append(exp.alias_(normalized, "NULLABLE", copy=False))
-                else:
-                    new_exprs.append(normalized)
-
-            select.set("expressions", new_exprs)
-
-        return root
-
-    def _replace_nullable_column(self, expr: exp.Expression) -> exp.Expression:
-        """递归替换列名为 NULLABLE 的列引用为 NULL。"""
-
-        def _transform(node: exp.Expression) -> exp.Expression:
-            if isinstance(node, exp.Column) and self._should_replace_nullable_column(node):
-                return exp.null()
-            return node
-
-        return expr.transform(_transform)
-
-    def _should_replace_nullable_column(self, col: exp.Column) -> bool:
-        """判断列是否为需替换的 NULLABLE，过滤掉带引号的列名。"""
-        col_name = col.name or ""
-        if col_name.upper() != "NULLABLE":
-            return False
-
-        identifier = col.this
-        if self._is_quoted_identifier(identifier):
-            return False
-        return True
-
-    @staticmethod
-    def _is_quoted_identifier(identifier: Optional[exp.Expression]) -> bool:
-        return isinstance(identifier, exp.Identifier) and bool(identifier.args.get("quoted"))
+    def _rewrite_nvl_new_column(self, sql: str) -> str:
+        """
+        将 NVL(x, default) x 这种“新建字段”写法改写为 default AS x，避免不存在的列导致解析报错。
+        仅匹配未加引号的标识符，default 假定为简单字面量/常量。
+        """
+        pattern = re.compile(
+            r"(?is)nvl\\s*\\(\\s*([A-Za-z_][\\w$#]*)\\s*,\\s*([^)]+?)\\s*\\)\\s+\\1(?![\\w$#])"
+        )
+        return pattern.sub(r"\\2 AS \\1", sql)
 
     def _collect_tables(self, root: exp.Expression) -> List[TableInfo]:
         tables: Dict[str, TableInfo] = {}
@@ -228,9 +197,7 @@ class AstAnalyzer:
                 for g_exp in group.expressions:
                     group_keys.add(g_exp.sql(dialect=self.dialect))
 
-            agg_funcs: List[exp.Func] = [
-                fn for fn in select.find_all(exp.Func) if getattr(fn, "is_aggregate", False)
-            ]
+            agg_funcs: List[exp.Func] = [fn for fn in select.find_all(exp.Func) if getattr(fn, "is_aggregate", False)]
             agg_expr_sqls = {fn.sql(dialect=self.dialect) for fn in agg_funcs}
             window_exprs = list(select.find_all(exp.Window))
 
@@ -349,3 +316,86 @@ class AstAnalyzer:
                 agg_funcs.add(func.name.upper())
 
         return has_group_by, has_window, sorted(agg_funcs)
+
+    if __name__ == "__main__":
+        from datus.utils.ast_analyzer import AstAnalyzer
+        analyzer = AstAnalyzer()
+        sql = """
+        CREATE OR REPLACE FORCE VIEW "LYWMS"."TPLA_EDI_T400_V" ("GOODSOWNERID", "TRADEID", "TRADEDATE", "OPERATIONTYPE", "DTLLINES", "USESTATUS", "TRADEDTLID", "OWNERGOODSID", "FROMCOMPANYID", "FROMSTORAGEID", "FROMGOODSTATUS", "FROMQUANSTATUS", "FROMBATCHNO", "FROMLOTNO", "FROMPRODDATE", "FROMVALIDDATE", "FROMAPPROVENO", "TOCOMPANYID", "TOSTORAGEID", "TOGOODSTATUS", "TOQUNSTATUS", "TOBATCHNO", "TOLOTNO", "TOPRODDATE", "TOVALIDDATE", "TOAPPROVENO", "TRADEGOODSQTY", "TRADEGOODSPACK", "GOODSPACKID", "QTY", "GSTORAGEID", "PACKNAME", "SRCDTLID", "PACKSIZE", "WAREHID", "PRINTMONTHFLAG", "PRINTEXPIREFLAG", "FROMVALIDDATE2", "TOVALIDDATE2", "TOLOTNOFACTNAME", "PRODMONTHFLAG", "TOPACKSIZE", "TOPACKNAME", "MAH", "TOMAH") AS 
+  select a.Goodsownerid, -- 1 :1:2ID
+       a.tradeid, --  2 :3:4:5:6:7ID
+       a.Tradedate,
+       '00' Operationtype, -- 4 :8:9:10:11
+       a.Dtllines, -- 5 :12:13:14:15:16:17:18:19:20
+       a.Usestatus, --  6 :21:22:23:24
+       b.Tradedtlid, -- 7 :25:26:27:28:29:30ID
+       d.goodsownid ownerGoodsid, --  8 :31:32:33:34:35ID
+       0 Fromcompanyid, -- 9 调整前货源单位ID
+       '' Fromstorageid, --  10  调整前仓别
+       ab.gostatusid FromGoodstatus, -- 11  调整前货品状态
+       aa.goquantityid Fromquanstatus, -- 12  :36:37:38:39:40:41:42
+       '0' Frombatchno, --  13  :43:44:45:46:47
+       b.Fromlotno, --  14  :48:49:50:51:52
+       b.Fromproddate Fromproddate,
+       b.FromValiddate FromValiddate,
+       b.FROMAPPROVEDOCNO FromApproveno, -- 17  :53:54:55:56:57:58:59
+       0 Tocompanyid,
+       '' Tostorageid, --  19  调整后仓别
+       ad.gostatusid ToGoodstatus, -- 20  :60:61:62:63:64:65:66
+       ac.goquantityid TOQUNSTATUS,
+       '0' Tobatchno, --  22  :67:68:69:70:71
+       b.Tolotno, --  23  :72:73:74:75:76
+       b.Toproddate Toproddate,
+       b.ToValiddate ToValiddate,
+       b.TOAPPROVEDOCNO ToApproveno, -- 26  :77:78:79:80:81:82:83
+       b.Tradegoodsqty, --  27  :84:85:86:87:88:89:90:91
+       b.Tradegoodspack, -- 28  :92:93:94:95:96:97
+       null Goodspackid, -- 29  :98:99
+       b.Qty, --  30  :100:101
+       '' gstorageid,
+       b.packname,
+       a.srcdtlid,
+       b.packsize,
+       a.warehid, --add by xyue 2016-03-09 新增中间表物流中心字段，用于区分同一核算单元下不同物流中心保管帐
+       e.printmonthflag,
+       e.printexpireflag,
+       e.validdate2 fromvaliddate2,
+       e.validdate2 tovaliddate2,
+       nvl(e.factname,d.factname) as tolotnofactname,
+       e.prodmonthflag,
+       xyue_get_trade_topacksize(b.tradedtlid) as topacksize,
+       xyue_get_trade_topackname(b.tradedtlid) as topackname,
+       e.mah,
+       e.mah as tomah
+  From Tpl_trade_order           a,
+       Tpl_trade_dtl             b,
+       tpl_goods                 d,
+       tpl_pub_goods_packs       d1,
+       tpl_edi_queue             h,
+       tpl_owner_quanstatus_def  aa,
+       tpl_owner_goodsstatus_def ab,
+       tpl_owner_quanstatus_def  ac,
+       tpl_owner_goodsstatus_def ad,
+       wms_goods_lot             e
+ Where a.tradeid = b.tradeid
+   and b.ownergoodsid = d.ownergoodsid
+   and b.goodspackid = d1.goodspackid
+   and a.usestatus = 3
+   and h.srcid = a.tradeid
+   and a.goodsownerid = aa.goodsownerid
+   and a.goodsownerid = ab.goodsownerid
+   and b.fromgoodsstatusid = ab.goodsstatusid
+   and b.fromquanstatus = aa.quantityid
+   and a.goodsownerid = ac.goodsownerid
+   and a.goodsownerid = ad.goodsownerid
+   and b.togoodsstatusid = ad.goodsstatusid
+   and b.toquanstatus = ac.quantityid
+   and nvl(h.expflag, 0) = 0
+   and h.queuetype = 3
+   and nvl(b.qty, 0) <> 0
+   and b.togoodsstatusid not in (-4, -3) --change by xyue 2020-08-19 货位丢失、在库丢失不反馈
+   and b.tolotid = e.lotid(+)
+ Order by a.tradeid
+        """
+        features = analyzer.analyze_view(sql)
+        print(features)
