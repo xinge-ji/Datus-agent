@@ -316,7 +316,7 @@ class ImportViewRunner:
         if not view_ids:
             return
         id_list = ",".join(view_ids)
-        self.meta_conn.execute({"sql_query": f"DELETE FROM dw_meta.ai_view_feature WHERE view_id IN ({id_list})"})
+        self.meta_conn.execute({"sql_query": f"DELETE FROM dw_meta.ai_view_feature WHERE table_id IN ({id_list})"})
         self.meta_conn.execute(
             {"sql_query": f"DELETE FROM dw_meta.std_field_mapping WHERE source_system = '{self.sourcedb}'"}
         )
@@ -431,13 +431,13 @@ class ImportViewRunner:
         return None
 
     # ---------- AST 落库 ---------- #
-    def _upsert_ai_view_feature(self, view_id: int, feature_json: str):
-        self.meta_conn.execute({"sql_query": f"DELETE FROM dw_meta.ai_view_feature WHERE view_id = {view_id}"})
+    def _upsert_ai_view_feature(self, table_id: int, feature_json: str):
+        self.meta_conn.execute({"sql_query": f"DELETE FROM dw_meta.ai_view_feature WHERE table_id = {table_id}"})
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         payload = self._escape(feature_json)
         sql = (
-            "INSERT INTO dw_meta.ai_view_feature (view_id, feature_json, analyzed_at) "
-            f"VALUES ({view_id}, '{payload}', '{now}')"
+            "INSERT INTO dw_meta.ai_view_feature (table_id, feature_json, analyzed_at) "
+            f"VALUES ({table_id}, '{payload}', '{now}')"
         )
         self.meta_conn.execute({"sql_query": sql})
 

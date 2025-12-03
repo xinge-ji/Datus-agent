@@ -198,15 +198,13 @@ class AstAnalyzer:
         """
         pattern = re.compile(r"\(\+\)")
         return pattern.sub("", sql)
-    
+
     def _rewrite_nvl_new_column(self, sql: str) -> str:
         """
         将 NVL(x, default) x 这种“新建字段”写法改写为 default AS x，避免不存在的列导致解析报错。
         仅匹配未加引号的标识符，default 假定为简单字面量/常量。
         """
-        pattern = re.compile(
-            r"(?is)nvl\\s*\\(\\s*([A-Za-z_][\\w$#]*)\\s*,\\s*([^)]+?)\\s*\\)\\s+\\1(?![\\w$#])"
-        )
+        pattern = re.compile(r"(?is)nvl\\s*\\(\\s*([A-Za-z_][\\w$#]*)\\s*,\\s*([^)]+?)\\s*\\)\\s+\\1(?![\\w$#])")
         return pattern.sub(r"\\2 AS \\1", sql)
 
     def _collect_tables(self, root: exp.Expression) -> List[TableInfo]:
@@ -299,42 +297,48 @@ class AstAnalyzer:
             if not isinstance(from_expr, exp.From):
                 continue
 
+            join_list = (select.args.get("joins") or []) + (from_expr.args.get("joins") or [])
             left_alias = self._extract_table_alias_from_from_this(from_expr.this)
-            join_list = from_expr.args.get("joins") or []
             current_left_alias = left_alias
+            seen_aliases: List[str] = [alias for alias in [left_alias] if alias]
+            where_join_eqs = self._extract_where_join_equalities(select.args.get("where"))
 
             for join in join_list:
                 if not isinstance(join, exp.Join):
                     continue
 
                 right_alias = self._extract_table_alias_from_from_this(join.this)
-                join_type = (join.args.get("kind") or "INNER").upper()
+                join_type = self._resolve_join_type(join)
 
                 conds: List[JoinCondition] = []
                 on_expr = join.args.get("on")
                 if on_expr is not None:
-                    for eq in on_expr.find_all(exp.EQ):
-                        left = eq.left
-                        right = eq.right
-                        left_sql = left.sql(dialect=self.dialect)
-                        right_sql = right.sql(dialect=self.dialect)
-                        jc = JoinCondition(left=left_sql, right=right_sql, op="=")
-                        if isinstance(left, exp.Column):
-                            jc.left_table_alias = left.table
-                            jc.left_column = left.name
-                        if isinstance(right, exp.Column):
-                            jc.right_table_alias = right.table
-                            jc.right_column = right.name
-                        conds.append(jc)
+                    conds.extend(self._extract_join_conditions_from_on(on_expr))
+                else:
+                    conds.extend(self._match_implicit_join_conditions(right_alias, seen_aliases, where_join_eqs))
+
+                join_left_alias = current_left_alias
+                if join_type == "IMPLICIT" and conds:
+                    other_aliases = [
+                        alias
+                        for cond in conds
+                        for alias in [cond.left_table_alias, cond.right_table_alias]
+                        if alias and alias != right_alias
+                    ]
+                    if other_aliases:
+                        join_left_alias = other_aliases[0]
 
                 joins.append(
                     JoinInfo(
-                        left_alias=current_left_alias or "",
+                        left_alias=join_left_alias or "",
                         right_alias=right_alias or "",
                         join_type=join_type,
                         conditions=conds,
                     )
                 )
+
+                if right_alias:
+                    seen_aliases.append(right_alias)
                 current_left_alias = right_alias
 
         return joins
@@ -353,8 +357,105 @@ class AstAnalyzer:
             return None
         return None
 
+    def _resolve_join_type(self, join: exp.Join) -> str:
+        kind = join.args.get("kind")
+        side = join.args.get("side")
+        if kind:
+            return str(kind).upper()
+        if side:
+            return str(side).upper()
+        if join.args.get("on") is None:
+            return "IMPLICIT"
+        return "INNER"
+
+    def _extract_join_conditions_from_on(self, on_expr: exp.Expression) -> List[JoinCondition]:
+        conds: List[JoinCondition] = []
+        for eq in on_expr.find_all(exp.EQ):
+            if not (isinstance(eq.left, exp.Column) and isinstance(eq.right, exp.Column)):
+                continue
+            conds.append(
+                JoinCondition(
+                    left=eq.left.sql(dialect=self.dialect),
+                    right=eq.right.sql(dialect=self.dialect),
+                    op="=",
+                    left_table_alias=eq.left.table,
+                    left_column=eq.left.name,
+                    right_table_alias=eq.right.table,
+                    right_column=eq.right.name,
+                )
+            )
+        return conds
+
+    def _extract_where_join_equalities(self, where_expr: Optional[exp.Expression]) -> List[JoinCondition]:
+        """
+        抽取最外层 WHERE 中的等值条件，跳过子查询内的条件。
+        """
+        if where_expr is None:
+            return []
+
+        conds: List[JoinCondition] = []
+        for eq in self._iter_eq_expressions(where_expr):
+            if not (isinstance(eq.left, exp.Column) and isinstance(eq.right, exp.Column)):
+                continue
+            conds.append(
+                JoinCondition(
+                    left=eq.left.sql(dialect=self.dialect),
+                    right=eq.right.sql(dialect=self.dialect),
+                    op="=",
+                    left_table_alias=eq.left.table,
+                    left_column=eq.left.name,
+                    right_table_alias=eq.right.table,
+                    right_column=eq.right.name,
+                )
+            )
+        return conds
+
+    def _match_implicit_join_conditions(
+        self, right_alias: Optional[str], seen_aliases: List[str], where_eqs: List[JoinCondition]
+    ) -> List[JoinCondition]:
+        if not right_alias:
+            return []
+
+        conds: List[JoinCondition] = []
+        for cond in where_eqs:
+            if not cond.left_table_alias or not cond.right_table_alias:
+                continue
+
+            pair = {cond.left_table_alias, cond.right_table_alias}
+            if right_alias not in pair:
+                continue
+
+            other_alias = (pair - {right_alias}).pop() if len(pair) == 2 else None
+            if other_alias and other_alias in seen_aliases:
+                conds.append(cond)
+
+        return conds
+
+    def _iter_eq_expressions(self, expr: exp.Expression):
+        """
+        遍历最外层布尔表达式中的等值比较，忽略子查询，避免误把子查询里的筛选当作主查询 join。
+        """
+        stack = [expr]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, exp.Subquery):
+                continue
+            if isinstance(node, exp.Select) and node is not expr:
+                continue
+            if isinstance(node, exp.EQ):
+                yield node
+            for child in node.iter_expressions():
+                stack.append(child)
+
     def _collect_global_features(self, root: exp.Expression) -> tuple[bool, bool, List[str]]:
-        has_group_by = any(isinstance(node, exp.Group) for node in root.walk())
+        main_select: Optional[exp.Select]
+        if isinstance(root, exp.Select):
+            main_select = root
+        else:
+            main_select = next(root.find_all(exp.Select), None)
+
+        group_expr = main_select.args.get("group") if main_select else None
+        has_group_by = isinstance(group_expr, exp.Group)
         has_window = any(isinstance(node, exp.Window) for node in root.walk())
 
         agg_funcs = set()
@@ -366,8 +467,9 @@ class AstAnalyzer:
 
     if __name__ == "__main__":
         from datus.utils.ast_analyzer import AstAnalyzer
+
         analyzer = AstAnalyzer()
-        sql = """
+        sql = """CREATE VIEW AS
          select a.receiveid,
        b.srcdtlno      orderdtlid,
        d.goodsownid    goodsid,
