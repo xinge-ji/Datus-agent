@@ -114,7 +114,8 @@ class AstAnalyzer:
 
     def _prepare_select_sql(self, sql_text: str) -> str:
         """从视图 DDL 中提取可解析的 SELECT，并去掉顶层包裹括号。"""
-        ddl_body = sql_text.strip()
+        ddl_body = self._normalize_commas(sql_text)
+        ddl_body = ddl_body.strip()
         ddl_body = ddl_body.rstrip(";")
 
         as_match = re.search(r"\bAS\b", ddl_body, flags=re.IGNORECASE)
@@ -122,6 +123,7 @@ class AstAnalyzer:
             ddl_body = ddl_body[as_match.end() :]
 
         ddl_body = ddl_body.strip()
+        ddl_body = self._strip_oracle_plus(ddl_body)
         ddl_body = self._strip_outer_select_parentheses(ddl_body)
         ddl_body = self._rewrite_nvl_new_column(ddl_body)
 
@@ -131,6 +133,44 @@ class AstAnalyzer:
             if select_match:
                 ddl_body = ddl_body[select_match.start() :].lstrip()
         return ddl_body
+
+    def _normalize_commas(self, sql: str) -> str:
+        """仅替换引号外的中文逗号为英文逗号，避免误改字符串字面量。"""
+        if "，" not in sql:
+            return sql
+
+        result: List[str] = []
+        in_single = False
+        in_double = False
+        i = 0
+        length = len(sql)
+
+        while i < length:
+            ch = sql[i]
+            if ch == "'" and not in_double:
+                # 单引号内采用 '' 转义，遇到成对单引号直接跳过一位
+                if in_single and i + 1 < length and sql[i + 1] == "'":
+                    result.append("''")
+                    i += 2
+                    continue
+                in_single = not in_single
+                result.append(ch)
+            elif ch == '"' and not in_single:
+                # 双引号内采用 "" 转义
+                if in_double and i + 1 < length and sql[i + 1] == '"':
+                    result.append('""')
+                    i += 2
+                    continue
+                in_double = not in_double
+                result.append(ch)
+            else:
+                if ch == "，" and not in_single and not in_double:
+                    result.append(",")
+                else:
+                    result.append(ch)
+            i += 1
+
+        return "".join(result)
 
     def _strip_outer_select_parentheses(self, sql: str) -> str:
         """仅在顶层 SELECT 被一对括号整体包裹时去掉括号。"""
@@ -152,6 +192,13 @@ class AstAnalyzer:
             return inner
         return trimmed
 
+    def _strip_oracle_plus(self, sql: str) -> str:
+        """
+        将 oracle 中的 (+) 去掉
+        """
+        pattern = re.compile(r"\(\+\)")
+        return pattern.sub("", sql)
+    
     def _rewrite_nvl_new_column(self, sql: str) -> str:
         """
         将 NVL(x, default) x 这种“新建字段”写法改写为 default AS x，避免不存在的列导致解析报错。
@@ -321,81 +368,82 @@ class AstAnalyzer:
         from datus.utils.ast_analyzer import AstAnalyzer
         analyzer = AstAnalyzer()
         sql = """
-        CREATE OR REPLACE FORCE VIEW "LYWMS"."TPLA_EDI_T400_V" ("GOODSOWNERID", "TRADEID", "TRADEDATE", "OPERATIONTYPE", "DTLLINES", "USESTATUS", "TRADEDTLID", "OWNERGOODSID", "FROMCOMPANYID", "FROMSTORAGEID", "FROMGOODSTATUS", "FROMQUANSTATUS", "FROMBATCHNO", "FROMLOTNO", "FROMPRODDATE", "FROMVALIDDATE", "FROMAPPROVENO", "TOCOMPANYID", "TOSTORAGEID", "TOGOODSTATUS", "TOQUNSTATUS", "TOBATCHNO", "TOLOTNO", "TOPRODDATE", "TOVALIDDATE", "TOAPPROVENO", "TRADEGOODSQTY", "TRADEGOODSPACK", "GOODSPACKID", "QTY", "GSTORAGEID", "PACKNAME", "SRCDTLID", "PACKSIZE", "WAREHID", "PRINTMONTHFLAG", "PRINTEXPIREFLAG", "FROMVALIDDATE2", "TOVALIDDATE2", "TOLOTNOFACTNAME", "PRODMONTHFLAG", "TOPACKSIZE", "TOPACKNAME", "MAH", "TOMAH") AS 
-  select a.Goodsownerid, -- 1 :1:2ID
-       a.tradeid, --  2 :3:4:5:6:7ID
-       a.Tradedate,
-       '00' Operationtype, -- 4 :8:9:10:11
-       a.Dtllines, -- 5 :12:13:14:15:16:17:18:19:20
-       a.Usestatus, --  6 :21:22:23:24
-       b.Tradedtlid, -- 7 :25:26:27:28:29:30ID
-       d.goodsownid ownerGoodsid, --  8 :31:32:33:34:35ID
-       0 Fromcompanyid, -- 9 调整前货源单位ID
-       '' Fromstorageid, --  10  调整前仓别
-       ab.gostatusid FromGoodstatus, -- 11  调整前货品状态
-       aa.goquantityid Fromquanstatus, -- 12  :36:37:38:39:40:41:42
-       '0' Frombatchno, --  13  :43:44:45:46:47
-       b.Fromlotno, --  14  :48:49:50:51:52
-       b.Fromproddate Fromproddate,
-       b.FromValiddate FromValiddate,
-       b.FROMAPPROVEDOCNO FromApproveno, -- 17  :53:54:55:56:57:58:59
-       0 Tocompanyid,
-       '' Tostorageid, --  19  调整后仓别
-       ad.gostatusid ToGoodstatus, -- 20  :60:61:62:63:64:65:66
-       ac.goquantityid TOQUNSTATUS,
-       '0' Tobatchno, --  22  :67:68:69:70:71
-       b.Tolotno, --  23  :72:73:74:75:76
-       b.Toproddate Toproddate,
-       b.ToValiddate ToValiddate,
-       b.TOAPPROVEDOCNO ToApproveno, -- 26  :77:78:79:80:81:82:83
-       b.Tradegoodsqty, --  27  :84:85:86:87:88:89:90:91
-       b.Tradegoodspack, -- 28  :92:93:94:95:96:97
-       null Goodspackid, -- 29  :98:99
-       b.Qty, --  30  :100:101
-       '' gstorageid,
-       b.packname,
-       a.srcdtlid,
-       b.packsize,
-       a.warehid, --add by xyue 2016-03-09 新增中间表物流中心字段，用于区分同一核算单元下不同物流中心保管帐
-       e.printmonthflag,
-       e.printexpireflag,
-       e.validdate2 fromvaliddate2,
-       e.validdate2 tovaliddate2,
-       nvl(e.factname,d.factname) as tolotnofactname,
-       e.prodmonthflag,
-       xyue_get_trade_topacksize(b.tradedtlid) as topacksize,
-       xyue_get_trade_topackname(b.tradedtlid) as topackname,
-       e.mah,
-       e.mah as tomah
-  From Tpl_trade_order           a,
-       Tpl_trade_dtl             b,
-       tpl_goods                 d,
-       tpl_pub_goods_packs       d1,
-       tpl_edi_queue             h,
-       tpl_owner_quanstatus_def  aa,
-       tpl_owner_goodsstatus_def ab,
-       tpl_owner_quanstatus_def  ac,
-       tpl_owner_goodsstatus_def ad,
-       wms_goods_lot             e
- Where a.tradeid = b.tradeid
-   and b.ownergoodsid = d.ownergoodsid
-   and b.goodspackid = d1.goodspackid
-   and a.usestatus = 3
-   and h.srcid = a.tradeid
-   and a.goodsownerid = aa.goodsownerid
-   and a.goodsownerid = ab.goodsownerid
-   and b.fromgoodsstatusid = ab.goodsstatusid
-   and b.fromquanstatus = aa.quantityid
-   and a.goodsownerid = ac.goodsownerid
-   and a.goodsownerid = ad.goodsownerid
-   and b.togoodsstatusid = ad.goodsstatusid
-   and b.toquanstatus = ac.quantityid
-   and nvl(h.expflag, 0) = 0
-   and h.queuetype = 3
-   and nvl(b.qty, 0) <> 0
-   and b.togoodsstatusid not in (-4, -3) --change by xyue 2020-08-19 货位丢失、在库丢失不反馈
-   and b.tolotid = e.lotid(+)
- Order by a.tradeid
+         select a.receiveid,
+       b.srcdtlno      orderdtlid,
+       d.goodsownid    goodsid,
+       d.goodsname,
+       d.goodstype,
+       d.tradepackname tradepack,
+       e.packname,
+       e.packsize,
+       a.goodsqty,
+       a.lotid,
+       g.lotno,
+       g.validdate,
+       g.proddate,
+       g.approvedocno,
+       g.mah,
+       a.goodsstatusid goodstatus,
+       a.goodsstatusid quanstatus,
+       d.prodarea,
+       d.factname      manufacturer,
+       f.companyname   supplyname,
+       --b.memo remark,
+       case
+         when a.checkmemo is not null and a.unqualifiedmemo is not null then
+          a.checkmemo || ' ' || a.unqualifiedmemo
+         else
+          null
+       end as remark, --仁心红不合格处理反馈
+       h.employeename shr,
+       b.shdate shdate,
+       i.employeename checkman,
+       a.checkdate checkdate,
+       (select min(t2.employeename)
+          from wms_st_io_doc t1, pub_employee t2
+         where t1.comefrom = 1
+           and t1.sourceid = a.receiveid
+           and t1.keepmanid = t2.employeeid) keepman,
+       (select max(t1.keepdate)
+          from wms_st_io_doc t1
+         where t1.comefrom = 1
+           and t1.sourceid = a.receiveid) keepdate,
+       c.warehid,
+       c.goodsownerid,
+       c.operationtype,
+       --decode(c.goodsownerid,9139,1,c.operationtype) operationtype,
+       c.zxcolumn4,
+       b.dhwd        as arrivaltemperature, --到货温度
+       a.invoicecode, --发票代码
+       a.invoiceno, --发票号码
+       to_char(a.invoicedate, 'yyyy-mm-dd') invoicedate --发票时间
+  from wms_receive_dtl     a,
+       wms_in_order_dtl    b,
+       wms_in_order        c,
+       tpl_goods           d,
+       tpl_pub_goods_packs e,
+       tpl_go_company      f,
+       wms_goods_lot       g,
+       pub_employee        h,
+       pub_employee        i
+ where a.indtlid = b.indtlid
+   and b.inid = c.inid
+   and a.ownergoodsid = d.ownergoodsid
+   and a.goodspackid = e.goodspackid
+   and c.goodsownerid = f.goodsownerid
+   and c.sourcecompanyid = f.companyid
+   and a.lotid = g.lotid
+   and a.usestatus = 4
+   and b.shrid = h.employeeid
+   and a.checkmanid1 = i.employeeid
+   and (c.goodsownerid <> 10007 or
+       (c.goodsownerid = 10007 and
+       c.zxcolumn4 in
+       (select zxcolumn4
+            from wms_in_order
+           where goodsownerid = 10007
+           group by zxcolumn4
+          having min(usestatus) = 3 and max(usestatus) = 3)))
         """
         features = analyzer.analyze_view(sql)
         print(features)

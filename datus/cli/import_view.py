@@ -139,6 +139,8 @@ class ImportViewRunner:
                 feature["unresolved_dependencies"] = sorted(deps["unresolved"])
                 feature_json = json.dumps(feature, ensure_ascii=True)
                 self._upsert_ai_view_feature(row.view_id, feature_json)
+                self._update_table_parse_status(row.view_id, "PARSED")
+                self._update_node_migration_status(row.view_id, "ANALYZED")
                 view_node_id = self._ensure_view_node(row.view_id, row.view_name)
                 dependency_nodes = self._ensure_dependency_nodes(deps["dep_info"])
                 self._upsert_relations(view_node_id, dependency_nodes, feature, deps["dep_info"])
@@ -157,6 +159,8 @@ class ImportViewRunner:
                 logger.error(f"视图解析失败 {row.view_name}: {exc}")
                 error_json = json.dumps({"status": "ERROR", "error": str(exc)}, ensure_ascii=True)
                 self._upsert_ai_view_feature(row.view_id, error_json)
+                self._update_table_parse_status(row.view_id, "FAILED")
+                self._update_node_migration_status(row.view_id, "AST_FAILED")
                 failed += 1
 
         dep_graph = self._build_view_dep_graph(analysis_results)
@@ -436,6 +440,36 @@ class ImportViewRunner:
             f"VALUES ({view_id}, '{payload}', '{now}')"
         )
         self.meta_conn.execute({"sql_query": sql})
+
+    def _update_table_parse_status(self, table_id: Optional[int], status: str):
+        if not table_id:
+            return
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        status_esc = self._escape(status.upper())
+        self.meta_conn.execute(
+            {
+                "sql_query": (
+                    "UPDATE dw_meta.table_source "
+                    f"SET parse_status = '{status_esc}', updated_at = '{now}' "
+                    f"WHERE table_id = {table_id}"
+                )
+            }
+        )
+
+    def _update_node_migration_status(self, table_id: Optional[int], status: str):
+        if not table_id:
+            return
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        status_esc = self._escape(status.upper())
+        self.meta_conn.execute(
+            {
+                "sql_query": (
+                    "UPDATE dw_meta.dw_node "
+                    f"SET migration_status = '{status_esc}', updated_at = '{now}' "
+                    f"WHERE source_table_id = {table_id}"
+                )
+            }
+        )
 
     def _ensure_view_node(self, view_id: int, view_name: str) -> int:
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")

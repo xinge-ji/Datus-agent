@@ -108,12 +108,13 @@ DW_META_TABLES: tuple[TableDefinition, ...] = (
     TableDefinition(
         name="table_source",
         columns="""
-table_id        BIGINT NOT NULL AUTO_INCREMENT,
+table_id       BIGINT NOT NULL AUTO_INCREMENT,
 source_system  VARCHAR(64) NOT NULL COMMENT 'ERP/CRM/..',
-table_name      VARCHAR(256) NOT NULL COMMENT '源表或视图名称',
+table_name     VARCHAR(256) NOT NULL COMMENT '源表或视图名称',
 table_type     VARCHAR(32) NOT NULL COMMENT 'TABLE/VIEW/MATERIALIZED_VIEW',
 ddl_sql        STRING       NOT NULL COMMENT '表或视图定义SQL',
 hash           VARCHAR(64)  NULL COMMENT 'SQL hash，避免重复处理',
+parse_status   VARCHAR(32) DEFAULT 'NEW' COMMENT 'NEW/PARSED/FAILED',
 created_at     DATETIME,
 updated_at     DATETIME,
 PRIMARY KEY (table_id)
@@ -130,8 +131,7 @@ source_table_id   BIGINT NULL COMMENT '如果是由某个表或视图迁移而�
 ai_layer_suggest  VARCHAR(16) NULL COMMENT 'AI建议层：DIM/DWD/DWS/OTHER',
 ai_confidence     DECIMAL(5,4) NULL,
 human_layer_final VARCHAR(16) NULL COMMENT '人确认后的层级',
-migration_status  VARCHAR(32) DEFAULT 'NEW' COMMENT 'NEW/ANALYZED/PROPOSED/REVIEWED/IMPLEMENTED/SKIPPED',
-remark            STRING NULL,
+migration_status  VARCHAR(32) DEFAULT 'NEW' COMMENT 'NEW/ANALYZED/PROPOSED/REVIEWED/IMPLEMENTED/SKIPPED/AST_FAILED',
 created_at        DATETIME,
 updated_at        DATETIME,
 PRIMARY KEY (node_id),
