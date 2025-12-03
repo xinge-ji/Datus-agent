@@ -64,6 +64,11 @@ class ImportViewRunner:
         self.meta_conn = self.db_manager.get_conn(namespace, meta_logic_db)
         self.ast = AstAnalyzer(dialect="oracle")
         self.llm: Optional[LLMBaseModel] = None
+        # 跨库前缀与 source_system 映射，例如 lyerp.table -> source_system=erp
+        self.schema_system_map = {
+            "lyerp": "erp",
+            "lywms": "wms",
+        }
 
     def sync_table_and_views(self) -> Dict[str, int]:
         """仅同步表/视图 DDL 到 table_source，不做 AST。"""
@@ -135,7 +140,7 @@ class ImportViewRunner:
         analysis_results: List[Dict[str, Any]] = []
         for row in view_records:
             if not row.view_id:
-                logger.warning("视图 %s 缺少 view_id，跳过解析", row.view_name)
+                logger.warning(f"视图 {row.view_name} 缺少 view_id，跳过解析")
                 continue
             try:
                 ddl_sql = row.ddl_sql or ""
@@ -143,7 +148,7 @@ class ImportViewRunner:
                 feature = self.ast.analyze_view(ddl_sql, row.view_name)
                 deps = self._resolve_dependencies(feature, table_source_map, row.db_name)
                 if deps["unresolved"]:
-                    logger.warning("视图 %s 依赖未解析: %s", row.view_name, deps["unresolved"])
+                    logger.warning(f"视图 {row.view_name} 依赖未解析: {deps['unresolved']}")
                 feature["status"] = "OK"
                 feature["view_dependencies"] = sorted(deps["view_dependencies"])
                 feature["table_dependencies"] = sorted(deps["table_dependencies"])
@@ -366,6 +371,69 @@ class ImportViewRunner:
         return status in {"REVIEWED", "IMPLEMENTED", "SKIPPED"}
 
     # ---------- 依赖解析与 DAG ---------- #
+    def _get_or_create_external_dependency(self, raw_name: str, db_prefix: Optional[str]) -> Optional[Dict[str, Any]]:
+        """
+        处理跨库/DBLink 依赖：映射前缀到目标系统，查询元数据，必要时创建虚拟表。
+        """
+        target_system = self.sourcedb
+        target_table_name = raw_name
+        is_virtual = False
+
+        # 显式 schema/db 前缀 (如 lyerp.table)
+        if db_prefix:
+            clean_prefix = str(db_prefix).lower()
+            if clean_prefix in self.schema_system_map:
+                target_system = self.schema_system_map[clean_prefix]
+
+        # DBLink 风格 (如 table@iwcs)
+        if "@" in raw_name:
+            real_table_name, dblink_name = raw_name.split("@", 1)
+            dblink_name = dblink_name.lower()
+            if dblink_name in self.schema_system_map:
+                target_system = self.schema_system_map[dblink_name]
+                target_table_name = real_table_name
+            else:
+                # 未知 DBLink，当前系统内生成虚拟表，例如 iwcs_table
+                target_system = self.sourcedb
+                target_table_name = f"{dblink_name}_{real_table_name}"
+                is_virtual = True
+
+        # 优先查已有元数据
+        sql = (
+            "SELECT table_id, table_type FROM dw_meta.table_source "
+            f"WHERE source_system = '{self._escape(target_system)}' "
+            f"AND table_name = '{self._escape(target_table_name)}' LIMIT 1"
+        )
+        res = self.meta_conn.execute({"sql_query": sql, "result_format": "list"})
+        rows = self._rows_from_result(res)
+        if rows:
+            return {
+                "table_id": rows[0].get("table_id"),
+                "table_type": (rows[0].get("table_type") or "").upper(),
+                "resolved_name": target_table_name,
+                "db_name": "",
+            }
+
+        # 未找到且需要虚拟表时，插入占位 EXTERNAL 节点，保证血缘不断裂
+        if is_virtual:
+            logger.info(f"创建虚拟表依赖: system={target_system}, table={target_table_name}")
+            virtual_row = ViewSourceRow(
+                view_id=None,
+                view_name=target_table_name,
+                db_name="",
+                ddl_sql="-- Virtual table created by dependency resolution",
+                sql_hash="virtual",
+            )
+            new_id = self._upsert_table_source(virtual_row, None, table_type="EXTERNAL")
+            return {
+                "table_id": new_id,
+                "table_type": "EXTERNAL",
+                "resolved_name": target_table_name,
+                "db_name": "",
+            }
+
+        return None
+
     def _resolve_dependencies(
         self, feature: Dict[str, Any], table_source_map: Dict[str, Dict[str, Any]], default_db: str
     ) -> Dict[str, Any]:
@@ -383,16 +451,28 @@ class ImportViewRunner:
             parsed = parse_table_name_parts(raw_name, dialect=DBType.ORACLE)
             resolved_name = parsed.get("table_name") or raw_name
             dep_key = resolved_name.lower()
-            db_name = t.get("db") or default_db
-            info = table_source_map.get(dep_key)
+            db_prefix = t.get("db")
+            db_name = db_prefix or default_db
+            info: Optional[Dict[str, Any]] = None
+            # 同库缓存优先（无前缀且非 DBLink）
+            if not db_prefix and "@" not in raw_name:
+                info = table_source_map.get(dep_key)
+            # 跨库或缓存未命中时尝试外部解析/虚拟表
+            if not info:
+                external_info = self._get_or_create_external_dependency(raw_name, db_prefix)
+                if external_info:
+                    info = external_info
+                    resolved_name = external_info.get("resolved_name") or resolved_name
+                    dep_key = resolved_name.lower()
             alias_key = alias or resolved_name
             if info:
-                dep_type = "VIEW" if (info.get("table_type") or "").upper() == "VIEW" else "TABLE"
+                t_type = (info.get("table_type") or "").upper()
+                dep_type = "VIEW" if t_type == "VIEW" else "TABLE"
                 t["source_type"] = dep_type
                 t["resolved_name"] = resolved_name
                 dep_info[alias_key] = {
                     "name": resolved_name,
-                    "db_name": db_name,
+                    "db_name": info.get("db_name", db_name),
                     "type": dep_type,
                     "source_table_id": info.get("table_id"),
                 }
@@ -434,7 +514,7 @@ class ImportViewRunner:
                 if indeg[dep] == 0:
                     queue.append(dep)
         if len(order) < len(graph):
-            logger.warning("检测到循环依赖，剩余未排序节点: %s", set(graph) - set(order))
+            logger.warning(f"检测到循环依赖，剩余未排序节点: {set(graph) - set(order)}")
             for k in graph:
                 if k not in order:
                     order.append(k)
@@ -559,7 +639,7 @@ class ImportViewRunner:
         rows_fb = self._rows_from_result(res_fb)
         if rows_fb:
             return int(rows_fb[0].get("node_id"))
-        logger.error("无法获取 dw_node 节点(插入后查询为空)，view=%s, table_id=%s", view_name, view_id)
+        logger.error(f"无法获取 dw_node 节点(插入后查询为空)，view={view_name}, table_id={view_id}")
         return 0
 
     def _ensure_dependency_nodes(self, dep_info: Dict[str, Dict[str, Any]]) -> Dict[str, int]:
@@ -823,7 +903,7 @@ def run_import_view(agent_config: AgentConfig, db_manager: DBManager, args) -> D
 
     # 先全量同步表/视图 DDL
     for name in names:
-        logger.info("开始同步 sourcedb=%s", name)
+        logger.info(f"开始同步 sourcedb={name}")
         runner = ImportViewRunner(
             agent_config=agent_config,
             db_manager=db_manager,
@@ -835,7 +915,7 @@ def run_import_view(agent_config: AgentConfig, db_manager: DBManager, args) -> D
 
     # 再统一做 AST 解析
     for name in names:
-        logger.info("开始解析 sourcedb=%s", name)
+        logger.info(f"开始解析 sourcedb={name}")
         runner = ImportViewRunner(
             agent_config=agent_config,
             db_manager=db_manager,
