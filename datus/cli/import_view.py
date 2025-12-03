@@ -142,8 +142,8 @@ class ImportViewRunner:
                 feature["unresolved_dependencies"] = sorted(deps["unresolved"])
                 feature_json = json.dumps(feature, ensure_ascii=True)
                 self._upsert_ai_view_feature(row.view_id, feature_json)
-                view_node_id = self._ensure_view_node(row.view_id, row.view_name, row.db_name)
-                dependency_nodes = self._ensure_dependency_nodes(deps["dep_info"], row.db_name)
+                view_node_id = self._ensure_view_node(row.view_id, row.view_name)
+                dependency_nodes = self._ensure_dependency_nodes(deps["dep_info"])
                 self._upsert_relations(view_node_id, dependency_nodes, feature, deps["dep_info"])
                 alias_map = {
                     (t.get("alias") or t.get("resolved_name") or t.get("name")): t for t in feature.get("tables", [])
@@ -440,11 +440,10 @@ class ImportViewRunner:
         )
         self.meta_conn.execute({"sql_query": sql})
 
-    def _ensure_view_node(self, view_id: int, view_name: str, db_name: str) -> int:
+    def _ensure_view_node(self, view_id: int, view_name: str) -> int:
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         view_name_esc = self._escape(view_name)
-        db_name_esc = self._escape(db_name)
-        # 仅按 source_table_id 或 source_system+table_name 识别视图节点，不再兼容 source_view_id
+        # 仅按 source_table_id 或 source_system+table_name 识别视图节点
         fetch = self.meta_conn.execute(
             {
                 "sql_query": (
@@ -486,10 +485,8 @@ class ImportViewRunner:
 
         insert = (
             "INSERT INTO dw_meta.dw_node "
-            "(node_type, source_system, db_name, table_name, source_table_id, migration_status, "
-            "created_at, updated_at) "
-            f"VALUES ('VIEW', '{self._escape(self.sourcedb)}', '{db_name_esc}', '{view_name_esc}', "
-            f"{view_id}, 'NEW', '{now}', '{now}')"
+            "(node_type, source_system, table_name, source_table_id, migration_status, created_at, updated_at) "
+            f"VALUES ('VIEW', '{self._escape(self.sourcedb)}', '{view_name_esc}', {view_id}, 'NEW', '{now}', '{now}')"
         )
         self.meta_conn.execute({"sql_query": insert})
         res = self.meta_conn.execute(
@@ -503,14 +500,25 @@ class ImportViewRunner:
         rows2 = self._rows_from_result(res)
         if rows2:
             return int(rows2[0].get("node_id"))
-        logger.error(f"无法获取 dw_node 节点(插入后查询为空)，view={view_name}")
+        res_fb = self.meta_conn.execute(
+            {
+                "sql_query": (
+                    "SELECT node_id FROM dw_meta.dw_node "
+                    f"WHERE source_system = '{self._escape(self.sourcedb)}' "
+                    f"AND table_name = '{view_name_esc}' ORDER BY node_id DESC LIMIT 1"
+                )
+            }
+        )
+        rows_fb = self._rows_from_result(res_fb)
+        if rows_fb:
+            return int(rows_fb[0].get("node_id"))
+        logger.error("无法获取 dw_node 节点(插入后查询为空)，view=%s, table_id=%s", view_name, view_id)
         return 0
 
-    def _ensure_dependency_nodes(self, dep_info: Dict[str, Dict[str, Any]], default_db: str) -> Dict[str, int]:
+    def _ensure_dependency_nodes(self, dep_info: Dict[str, Dict[str, Any]]) -> Dict[str, int]:
         nodes: Dict[str, int] = {}
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         for alias, info in dep_info.items():
-            db = self._escape(info.get("db_name") or default_db)
             table_nm = self._escape(info.get("name") or "")
             node_type = "VIEW" if info.get("type") == "VIEW" else "TABLE"
             source_table_id = info.get("source_table_id")
@@ -519,7 +527,7 @@ class ImportViewRunner:
                     "sql_query": (
                         "SELECT node_id FROM dw_meta.dw_node "
                         f"WHERE source_system = '{self._escape(self.sourcedb)}' "
-                        f"AND db_name = '{db}' AND table_name = '{table_nm}' LIMIT 1"
+                        f"AND table_name = '{table_nm}' LIMIT 1"
                     )
                 }
             )
@@ -529,8 +537,8 @@ class ImportViewRunner:
             else:
                 insert = (
                     "INSERT INTO dw_meta.dw_node "
-                    "(node_type, source_system, db_name, table_name, source_table_id, migration_status, created_at, updated_at) "
-                    f"VALUES ('{node_type}', '{self._escape(self.sourcedb)}', '{db}', '{table_nm}', "
+                    "(node_type, source_system, table_name, source_table_id, migration_status, created_at, updated_at) "
+                    f"VALUES ('{node_type}', '{self._escape(self.sourcedb)}', '{table_nm}', "
                     f"{source_table_id if source_table_id is not None else 'NULL'}, 'NEW', '{now}', '{now}')"
                 )
                 self.meta_conn.execute({"sql_query": insert})
@@ -539,7 +547,7 @@ class ImportViewRunner:
                         "sql_query": (
                             "SELECT node_id FROM dw_meta.dw_node "
                             f"WHERE source_system = '{self._escape(self.sourcedb)}' "
-                            f"AND db_name = '{db}' AND table_name = '{table_nm}' "
+                            f"AND table_name = '{table_nm}' "
                             "ORDER BY node_id DESC LIMIT 1"
                         )
                     }
