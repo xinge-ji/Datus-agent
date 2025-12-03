@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import re
+
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
 
@@ -76,8 +78,9 @@ class AstAnalyzer:
         :return: 可 JSON 序列化的 dict
         """
         # 先尝试使用配置的方言（默认 Oracle），如果失败则回退到 MySQL
+        select_sql = self._prepare_select_sql(sql_text)
         try:
-            root: exp.Expression = parse_one(sql_text, read=self.dialect)
+            root: exp.Expression = parse_one(select_sql, read=self.dialect)
             logger.debug(f"Successfully parsed SQL for view {view_name or ''} using {self.dialect} dialect")
         except Exception as oracle_exc:
             logger.debug(
@@ -85,7 +88,7 @@ class AstAnalyzer:
                 f"Falling back to MySQL dialect."
             )
             try:
-                root: exp.Expression = parse_one(sql_text, read="mysql")
+                root: exp.Expression = parse_one(select_sql, read="mysql")
                 logger.debug(f"Successfully parsed SQL for view {view_name or ''} using MySQL dialect (fallback)")
             except Exception as mysql_exc:
                 raise ValueError(
@@ -93,6 +96,7 @@ class AstAnalyzer:
                     f"Oracle error: {oracle_exc}. MySQL error: {mysql_exc}"
                 ) from mysql_exc
 
+        root = self._normalize_nullable(root)
         tables = self._collect_tables(root)
         columns = self._collect_columns(root)
         joins = self._collect_joins(root)
@@ -108,6 +112,86 @@ class AstAnalyzer:
             joins=joins,
         )
         return asdict(vf)
+
+    def _prepare_select_sql(self, sql_text: str) -> str:
+        """从视图 DDL 中提取可解析的 SELECT，并去掉顶层包裹括号。"""
+        ddl_body = sql_text.strip()
+        ddl_body = ddl_body.rstrip(";")
+
+        as_match = re.search(r"\bAS\b", ddl_body, flags=re.IGNORECASE)
+        if as_match:
+            ddl_body = ddl_body[as_match.end() :]
+
+        ddl_body = ddl_body.strip()
+        ddl_body = self._strip_outer_select_parentheses(ddl_body)
+        return ddl_body
+
+    def _strip_outer_select_parentheses(self, sql: str) -> str:
+        """仅在顶层 SELECT 被一对括号整体包裹时去掉括号。"""
+        trimmed = sql.strip()
+        if not (trimmed.startswith("(") and trimmed.endswith(")")):
+            return trimmed
+
+        depth = 0
+        for idx, ch in enumerate(trimmed):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0 and idx != len(trimmed) - 1:
+                    return trimmed
+
+        inner = trimmed[1:-1].strip()
+        if re.match(r"(?is)^select\\b", inner):
+            return inner
+        return trimmed
+
+    def _normalize_nullable(self, root: exp.Expression) -> exp.Expression:
+        """仅在列列表中将非别名的 NULLABLE 字段引用替换为 NULL。"""
+        for select in root.find_all(exp.Select):
+            new_exprs: List[exp.Expression] = []
+            for proj in select.expressions:
+                if isinstance(proj, exp.Alias):
+                    normalized = self._replace_nullable_column(proj.this)
+                    proj.set("this", normalized)
+                    new_exprs.append(proj)
+                    continue
+
+                should_alias_nullable = isinstance(proj, exp.Column) and self._should_replace_nullable_column(proj)
+                normalized = self._replace_nullable_column(proj)
+                if should_alias_nullable and not proj.alias:
+                    new_exprs.append(exp.alias_(normalized, "NULLABLE", copy=False))
+                else:
+                    new_exprs.append(normalized)
+
+            select.set("expressions", new_exprs)
+
+        return root
+
+    def _replace_nullable_column(self, expr: exp.Expression) -> exp.Expression:
+        """递归替换列名为 NULLABLE 的列引用为 NULL。"""
+
+        def _transform(node: exp.Expression) -> exp.Expression:
+            if isinstance(node, exp.Column) and self._should_replace_nullable_column(node):
+                return exp.null()
+            return node
+
+        return expr.transform(_transform)
+
+    def _should_replace_nullable_column(self, col: exp.Column) -> bool:
+        """判断列是否为需替换的 NULLABLE，过滤掉带引号的列名。"""
+        col_name = col.name or ""
+        if col_name.upper() != "NULLABLE":
+            return False
+
+        identifier = col.this
+        if self._is_quoted_identifier(identifier):
+            return False
+        return True
+
+    @staticmethod
+    def _is_quoted_identifier(identifier: Optional[exp.Expression]) -> bool:
+        return isinstance(identifier, exp.Identifier) and bool(identifier.args.get("quoted"))
 
     def _collect_tables(self, root: exp.Expression) -> List[TableInfo]:
         tables: Dict[str, TableInfo] = {}
