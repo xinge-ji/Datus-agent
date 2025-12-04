@@ -809,25 +809,73 @@ class ImportViewRunner:
     # ---------- 新增阶段辅助 ---------- #
     def _load_views_from_meta_for_analysis(self) -> List[Dict[str, Any]]:
         sql = (
-            "SELECT table_id as view_id, table_name as view_name, ddl_sql, parse_status, hash "
-            "FROM dw_meta.table_source "
-            f"WHERE source_system = '{self.sourcedb}' AND table_type = 'VIEW'"
+            "SELECT ts.table_id as view_id, ts.table_name as view_name, ts.ddl_sql, ts.parse_status, ts.hash, "
+            "af.feature_json "
+            "FROM dw_meta.table_source ts "
+            "LEFT JOIN dw_meta.ai_view_feature af ON ts.table_id = af.table_id "
+            f"WHERE ts.source_system = '{self.sourcedb}' AND ts.table_type = 'VIEW'"
         )
         res = self.meta_conn.execute({"sql_query": sql, "result_format": "list"})
-        return self._rows_from_result(res)
+        rows = self._rows_from_result(res)
+        if self.strategy == "overwrite":
+            return rows
+
+        filtered: List[Dict[str, Any]] = []
+        for row in rows:
+            status = (row.get("parse_status") or "").upper()
+            current_hash = row.get("hash") or ""
+            feature_json = row.get("feature_json") or ""
+            prev_hash = ""
+            if feature_json:
+                try:
+                    prev_hash = (json.loads(feature_json) or {}).get("source_hash") or ""
+                except Exception:
+                    prev_hash = ""
+
+            if status != "PARSED":
+                filtered.append(row)
+                continue
+            if not prev_hash or prev_hash != current_hash:
+                filtered.append(row)
+        return filtered
 
     def _load_nodes_for_classification(self) -> List[Dict[str, Any]]:
         sql = (
             "SELECT n.node_id, n.table_name as view_name, n.source_table_id, "
             "n.human_layer_final, n.migration_status, "
-            "f.feature_json, t.ddl_sql "
+            "f.feature_json, t.ddl_sql, t.hash "
             "FROM dw_meta.dw_node n "
             "LEFT JOIN dw_meta.ai_view_feature f ON n.source_table_id = f.table_id "
             "LEFT JOIN dw_meta.table_source t ON n.source_table_id = t.table_id "
             f"WHERE n.source_system = '{self.sourcedb}' AND n.node_type = 'VIEW'"
         )
         res = self.meta_conn.execute({"sql_query": sql, "result_format": "list"})
-        return self._rows_from_result(res)
+        rows = self._rows_from_result(res)
+        if self.strategy == "overwrite":
+            return rows
+
+        filtered: List[Dict[str, Any]] = []
+        success_status = {"REVIEWED", "IMPLEMENTED", "SKIPPED"}
+        for row in rows:
+            status = (row.get("migration_status") or "").upper()
+            current_hash = row.get("hash") or ""
+            feature_json = row.get("feature_json") or ""
+            prev_hash = ""
+            if feature_json:
+                try:
+                    prev_hash = (json.loads(feature_json) or {}).get("source_hash") or ""
+                except Exception:
+                    prev_hash = ""
+
+            if status not in success_status:
+                filtered.append(row)
+                continue
+
+            # 成功但内容有更新/缺少特征时需要重跑
+            if not prev_hash or (current_hash and prev_hash != current_hash):
+                filtered.append(row)
+
+        return filtered
 
     def _build_graph_from_nodes(self, nodes: List[Dict[str, Any]]) -> Dict[str, Set[str]]:
         graph: Dict[str, Set[str]] = {}
@@ -862,7 +910,30 @@ class ImportViewRunner:
             f"WHERE ts.source_system = '{self.sourcedb}' AND ts.table_type = 'VIEW'"
         )
         res = self.meta_conn.execute({"sql_query": sql, "result_format": "list"})
-        return self._rows_from_result(res)
+        rows = self._rows_from_result(res)
+        if self.strategy == "overwrite":
+            return rows
+
+        filtered: List[Dict[str, Any]] = []
+        for row in rows:
+            view_name = row.get("view_name") or ""
+            current_hash = row.get("hash") or ""
+            feature_json = row.get("feature_json") or ""
+            feature_hash = ""
+            if feature_json:
+                try:
+                    feature_hash = (json.loads(feature_json) or {}).get("source_hash") or ""
+                except Exception:
+                    feature_hash = ""
+
+            has_mapping = self._has_existing_mapping(view_name)
+            if not has_mapping:
+                filtered.append(row)
+                continue
+            if not feature_hash or feature_hash != current_hash:
+                filtered.append(row)
+
+        return filtered
 
     def _has_existing_mapping(self, view_name: str) -> bool:
         sql = (
