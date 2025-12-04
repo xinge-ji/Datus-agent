@@ -359,6 +359,11 @@ class AstAnalyzer:
     def _strip_outer_select_parentheses(self, sql: str) -> str:
         """仅在顶层 SELECT 被一对括号整体包裹时去掉括号。"""
         trimmed = sql.strip()
+        # 末尾存在形如 ") -- xxx" 的注释时，先移除尾部注释再判断括号
+        tail_comment = re.search(r"\)\s*--.*$", trimmed)
+        if tail_comment:
+            trimmed = trimmed[: tail_comment.start() + 1].rstrip()
+
         if not (trimmed.startswith("(") and trimmed.endswith(")")):
             return trimmed
 
@@ -371,7 +376,25 @@ class AstAnalyzer:
                 if depth == 0 and idx != len(trimmed) - 1:
                     return trimmed
 
-        inner = trimmed[1:-1].strip()
+        inner = trimmed[1:-1].lstrip()
+        # 去掉内层开头的行注释与块注释，再判断是否 select/with 开头
+        while True:
+            if inner.startswith("--"):
+                newline = inner.find("\n")
+                if newline == -1:
+                    inner = ""
+                    break
+                inner = inner[newline + 1 :].lstrip()
+                continue
+            if inner.startswith("/*"):
+                end = inner.find("*/")
+                if end == -1:
+                    inner = ""
+                    break
+                inner = inner[end + 2 :].lstrip()
+                continue
+            break
+
         if re.match(r"(?is)^select\b", inner):
             return inner
         return trimmed
@@ -667,48 +690,26 @@ class AstAnalyzer:
         from datus.utils.ast_analyzer import AstAnalyzer
 
         analyzer = AstAnalyzer()
-        sql = """CREATE VIEW AS
-         SELECT org."fnumber"          AS "entryid", --独立单元id
-       wh."fnumber"           AS "warehouseid", --仓库id
-       wh."fname"             AS "warehousename", --仓库名称
-       gds."fnumber"          AS "drugCode", --药品编码
-       invs."fqty"            AS "stock", -- 库存
-       invs."fbatch_no"       AS "batchNum", --批号
-       invs."fmanu_date"      AS "prodDate", --生产日期
-       invs."fexpiry_date"    AS "validity", --到期日期
-       gds."fname"            AS "drugName", -- 商品名称
-       gds."fspecs"           AS "pack", -- 商品规格
-       gds."fmanufacturer_cn" AS "factory", -- 生产厂家
-       uni."fname"            AS "unit", -- 单位
-       gds."fbarcode"         AS "barcode", -- 商品条形码
-       gds."fapproval_no"     AS "approval", -- 批准文号
-       tax."fname"            AS "taxRate", -- 税率名称
+        sql = """
+CREATE OR REPLACE FORCE VIEW "LYERP"."GSP_COMPANY_LC_DTL_V" ("LCDTLID", "LCDOCID", "LICENSETYPEID", "LICENSENAME", "FACTORYFLAG", "CUSTOMFLAG", "SUPPLYFLAG", "RANGEFLAG", "REMINDMETHOD", "EARLYWARNDAYS", "SUPERDAYS") AS 
+  (
+-- 企业证照管控细单视图
+select
+a.lcdtlid,
+a.lcdocid,
+a.licensetypeid,
+b.licensename ,
+b.factoryflag,
+b.customflag,
+b.supplyflag,
+b.rangeflag,
+a.remindmethod,
+a.earlywarndays,
+a.superdays
 
-       null AS "busiType", --经营范围类别
-       remote2."fk_yn_price" AS "price", --价格
-       1    AS "step", --采购倍数 购买增量、步长(数字类型)
-       null AS "midPack", --中包装数
-       null AS "wholePack", --整包装数
-       null AS "recommendedPrice" --建议零售价
-  FROM "rm_gsm_im_inv_balance"@cosmic_pro_secd.ly.com invs --rm_gsm_im_inv_balance是雨诺库存表
- INNER JOIN "rm_bd_goods"@cosmic_pro_secd.ly.com gds
-    ON invs."fgoods_id" = gds."fid" --rm_bd_goods是雨诺商品表
- INNER JOIN "ft_t_org_org"@cosmic_pro_secd.ly.com org
-    ON invs."fbizorg_id" = org."fid" --ft_t_org_org是雨诺的组织表(外部)
- INNER JOIN "rm_bd_warehouse"@cosmic_pro_secd.ly.com wh
-    ON invs."fwarehouse_id" = wh."fid" --rm_bd_warehouse是雨诺的仓库表
-  LEFT JOIN "rm_bd_measureunit"@cosmic_pro_secd.ly.com uni--rm_bd_measureunit是雨诺的单位表
-    ON uni."fid" = gds."fbaseunit_id"
-  LEFT JOIN "rm_bd_tax_rate"@cosmic_pro_secd.ly.com tax
-    ON gds."fsales_taxrate_id" = tax."fid" --rm_bd_tax_rate是雨诺的税率表
-      LEFT JOIN "rm_bd_goods_m"@cosmic_pro_secd.ly.com remote1
-    ON gds."fid" = remote1."fid"
-          LEFT JOIN "tk_yn_mdm_ysb_goods"@cosmic_pro_lycus.ly.com remote2
-    ON remote2."fnumber" = gds."fnumber"
- WHERE
---invs."fbizorg_id" = '2113718453792679940' AND fbizorg_id是组织单位,每张表略有不同 这里是entryid=682的fid
- invs."fqty" > 0
- and remote1."fisban_online_sales"=0
+from gsp_license_control_dtl a ,
+gsp_license_type b
+where a.licensetypeid = b.licensetypeid)
         """
         features = analyzer.analyze_view(sql)
         print(features)

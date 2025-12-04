@@ -694,6 +694,8 @@ class ImportViewRunner:
                 "resolved_name": target_table_name,
                 "db_name": "",
             }
+        else:
+            is_virtual = True
 
         # 未找到且需要虚拟表时，插入占位 EXTERNAL 节点，保证血缘不断裂
         if is_virtual:
