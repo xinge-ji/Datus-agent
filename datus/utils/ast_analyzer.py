@@ -690,25 +690,43 @@ class AstAnalyzer:
 
         analyzer = AstAnalyzer()
         sql = """
-CREATE OR REPLACE FORCE VIEW "LYERP"."GSP_COMPANY_LC_DTL_V" ("LCDTLID", "LCDOCID", "LICENSETYPEID", "LICENSENAME", "FACTORYFLAG", "CUSTOMFLAG", "SUPPLYFLAG", "RANGEFLAG", "REMINDMETHOD", "EARLYWARNDAYS", "SUPERDAYS") AS 
-  (
--- 企业证照管控细单视图
-select
-a.lcdtlid,
-a.lcdocid,
-a.licensetypeid,
-b.licensename ,
-b.factoryflag,
-b.customflag,
-b.supplyflag,
-b.rangeflag,
-a.remindmethod,
-a.earlywarndays,
-a.superdays
 
-from gsp_license_control_dtl a ,
-gsp_license_type b
-where a.licensetypeid = b.licensetypeid)
+  CREATE OR REPLACE FORCE VIEW "LYERP"."BMS_ST_RE_DTL_V" ("REID", "REDTLID", "STORAGEID", "GOODSID", "GOODSQTY", "REALPRICE", "CHECKMANID", "CHECKDATE", "SUPPLYTAXRATE", "TRANSTEP", "IMPORTREPFLAG", "PASSGATEFLAG", "REGISTEFLAG", "GENQUCHKFLAG", "LOWESTPRICE", "LASTPRICE", "SUPPLYLASTPRICE", "SUPPLYERID", "LIMITID", "LIMITCUSTOMERSETID", "BANNEDCUSTOMERID", "BANNEDCUSTOMERSETID", "SUCONDTLID", "FETCHDTLID", "HASPRESENDFLAG", "PRESENDINFO", "GOODSDTLID", "BATCHID", "LOTID", "POSID", "POSMEMO", "GOODSSTATUSID", "PACKQUALITY", "FACEQUALITY", "ASKCHKFLAG", "PACKQTY", "UNITPRICE", "STORAGENAME", "STORAGEOPCODE", "GOODSOPCODE", "GOODSNAME", "CURRENCYNAME", "TRANSCONDITION", "BUSISCOPE", "MEDICINETYPE", "GOODSTYPE", "GOODSUNIT", "PRODAREA", "FACTORYID", "FACTORYNAME", "CHECKMANNAME", "CHECKMANOPCODE", "SUPPLYERNAME", "SUPPLYEROPCODE", "LIMITNAME", "LIMITCUSTOMERSETNAME", "BANNEDCUSTOMERNAME", "BANNEDCUSTOMERSETNAME", "PACKNAME", "BATCHNO", "LOTNO", "PRODDATE", "INVALIDDATE", "KILLDATE", "KILLLOTNO", "CHECKNO", "APPROVEDOCNO", "PRINTSET", "POSNO", "GOODSUNITFLAG", "SUCONGOODSQTY", "POSFLAG", "PACKSIZE", "SALERID", "GOODSSTATUS", "QUALITYSTATUS", "QUALITYCHECKMANID", "QUALITYCHECKMAN", "QUALITYDATE", "ELIGIBGOODSQTY", "UNELIGIBGOODSQTY", "MEMO", "CHECKDOCID", "ASKCHECKID", "CHECKDOCNO", "IFCHECKFLAG", "GOODSUPQTY", "ASKCHECKQTY", "OLDRGDTLID", "STORAGECONDITION", "UNQUALIFIEDMETHOD", "TRANSMETHOD", "TRANSTIMES", "TRANSTEMP", "UNQUALIFIEDMEMO", "ZX_TOQUALIFIEDRESON", "BACKWHYID", "REALMOMEY", "NOTAXREALPRICE", "NOTAXMONEY", "FARMNOTAXREALPRICE", "FARMNOTAXMONEY", "SYNCHRONIZEDAPPROVETOGOODS", "BIGCON", "INVNO", "INVDATE", "INVCODE", "ARRIVEDATE", "PLACEPOINTID", "PLACEPOINTNAME", "ISPOSFLAG", "INVALIDDATEFLAG", "TOINVDAYSWARN", "TRANSPORTADD", "TRANSPORTDATE", "TEMPCONTROL", "ECODEFLAG", "SFYJYBGS", "SFFHYQ", "DHWD", "DHSJ", "RECEIVESQTY", "FPY", "SUPPLYCHECKFLAG", "QUALITYCHECKFLAG", "INFOCHECKFLAG", "SUCONMEMO", "YLFQTY", "YLFCSSJ", "YLFNUM", "YLFSUM", "GOODSNO", "PACKQTY1", "GRADE", "ZX_REACHDATE", "SUCONID", "ZX_PRECOMBINATIONID", "SCOPENAME", "APPROVEDOCNO2", "GOODSENGNAME", "ZX_SSXKCYR", "UDISTRINGSAVED", "CURRENTRECQTY", "UDISTRING", "COMPANYID", "ZX_SFSM", "ZD_FLAG") AS 
+  Select a.REID
+  From (Select t.comefrom,
+               t.sourceid,
+               t.entryid,
+               -- LISTAGG(t.ecode, ',') WITHIN GROUP(ORDER BY t.ecode),
+               --rtrim(xmlagg(xmlelement(e,t.ecode,',').extract('//text()') order by t.ecode).GetClobVal(),',')
+               --xmlagg(xmlparse(content t.ecode||',' wellformed) order by t.ecode).getclobval() as ecode
+               xmlagg(xmlparse(content t.ecode || ',' wellformed) Order By Null).getclobval() As ecodes
+
+          From bms_ecode_record t
+         Where t.comefrom = 2
+         Group By t.entryid, t.comefrom, t.sourceid) eco
+ Where a.storageid = b.storageid
+   And a.goodsid = c.goodsid
+   And a.checkmanid = d.employeeid
+   And a.supplyerid = e.employeeid
+   And a.limitid = lim.customid
+   And a.limitcustomersetid = limset.setid
+   And a.bannedcustomerid = banned.customid
+   And a.bannedcustomersetid = bannedSet.Setid
+   And a.goodsdtlid = f.goodsdtlid
+   And a.batchid = g.batchid
+   And a.lotid = h.lotid
+   And a.posid = i.posid
+   And a.sucondtlid = bms_su_con_dtl.sucondtlid --add by ybh20141119   收货明细增加到货温度及时间
+   And c.factoryid = j.factoryid
+   And a.qualitycheckmanid = k.employeeid
+   And a.goodsstatusid = l.goodsstatusid
+   And a.checkdocid = m.checkdocid
+   And a.askcheckid = n.askcheckid
+   And a.placepointid = o.placepointid
+   And a.goodsid = q.goodsid
+   And doc.entryid = q.entryid
+   And a.reid = doc.reid
+   And a.redtlid = eco.sourceid
         """
         features = analyzer.analyze_view(sql)
         print(features)

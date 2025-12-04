@@ -571,6 +571,7 @@ class ImportViewRunner:
         view_name = self._escape(row.view_name)
         ddl_sql = self._escape(row.ddl_sql)
         sql_hash = self._escape(row.sql_hash)
+        source_system = self._escape(row.db_name) if self._escape(row.db_name) != "" else self.sourcedb
 
         # 已存在且 hash 未变
         if existing and existing.sql_hash == row.sql_hash:
@@ -590,7 +591,7 @@ class ImportViewRunner:
         insert = (
             "INSERT INTO dw_meta.table_source "
             "(source_system, table_name, table_type, ddl_sql, hash, created_at, updated_at) "
-            f"VALUES ('{self.sourcedb}', '{view_name}', '{table_type}', '{ddl_sql}', '{sql_hash}', '{now}', '{now}')"
+            f"VALUES ('{source_system}', '{view_name}', '{table_type}', '{ddl_sql}', '{sql_hash}', '{now}', '{now}')"
         )
         self.meta_conn.execute({"sql_query": insert})
         res = self.meta_conn.execute(
@@ -703,7 +704,7 @@ class ImportViewRunner:
             virtual_row = ViewSourceRow(
                 view_id=None,
                 view_name=target_table_name,
-                db_name="",
+                db_name=target_system,
                 ddl_sql="-- Virtual table created by dependency resolution",
                 sql_hash="virtual",
             )
