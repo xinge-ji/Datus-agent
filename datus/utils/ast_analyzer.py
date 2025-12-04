@@ -140,7 +140,6 @@ class AstAnalyzer:
             if select_match:
                 ddl_body = ddl_body[select_match.start() :].lstrip()
 
-        print(ddl_body)
         return ddl_body
 
     def _normalize_commas_and_parentheses(self, sql: str) -> str:
