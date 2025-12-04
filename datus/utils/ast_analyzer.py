@@ -114,9 +114,13 @@ class AstAnalyzer:
 
     def _prepare_select_sql(self, sql_text: str) -> str:
         """从视图 DDL 中提取可解析的 SELECT，并去掉顶层包裹括号。"""
-        ddl_body = self._normalize_commas_and_parentheses(sql_text)
-        ddl_body = self._replace_cdiwcs_domain(ddl_body)
+        ddl_body = self._strip_block_comments(sql_text)
+        ddl_body = self._normalize_commas_and_parentheses(ddl_body)
         ddl_body = self._normalize_dblink_spacing(ddl_body)
+        ddl_body = self._strip_ly_domain_in_dblink(ddl_body)
+        ddl_body = self._replace_cdiwcs_domain(ddl_body)
+        ddl_body = self._normalize_comparison_operators(ddl_body)
+        ddl_body = self._strip_extra_closing_parentheses(ddl_body)
         ddl_body = ddl_body.strip()
         ddl_body = ddl_body.rstrip(";")
 
@@ -178,6 +182,85 @@ class AstAnalyzer:
 
         return "".join(result)
 
+    def _strip_block_comments(self, sql: str) -> str:
+        """删除 /* */ 包围的块注释。"""
+        return re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)
+
+    def _normalize_comparison_operators(self, sql: str) -> str:
+        """将 > =、< =、< > 之间的空格去掉。"""
+        sql = re.sub(r">\s+=", ">=", sql)
+        sql = re.sub(r"<\s+=", "<=", sql)
+        sql = re.sub(r"<\s+>", "<>", sql)
+        return sql
+
+    def _strip_ly_domain_in_dblink(self, sql: str) -> str:
+        """仅在跨库表引用中去掉 .ly.com 域名（形如 table@xxx.ly.com -> table@xxx）。"""
+        pattern = re.compile(r"(?i)(\b[A-Za-z_][\w$#]*)@([A-Za-z_][\w$#]*(?:\.[A-Za-z_][\w$#]*)*?)\.ly\.com\b")
+        return pattern.sub(lambda m: f"{m.group(1)}@{m.group(2)}", sql)
+
+    def _strip_extra_closing_parentheses(self, sql: str) -> str:
+        """删除多余的右括号（默认出现在末端），忽略字符串和行注释内的括号。"""
+        opens, closes = self._collect_paren_positions(sql)
+        extra = len(closes) - len(opens)
+        if extra <= 0:
+            return sql
+
+        remove_indices = set(closes[-extra:])
+        return "".join(ch for idx, ch in enumerate(sql) if idx not in remove_indices)
+
+    def _collect_paren_positions(self, sql: str) -> tuple[List[int], List[int]]:
+        """收集引号与行注释外的括号位置，用于平衡计算。"""
+        opens: List[int] = []
+        closes: List[int] = []
+        in_single = False
+        in_double = False
+        in_line_comment = False
+        i = 0
+        length = len(sql)
+
+        while i < length:
+            ch = sql[i]
+
+            if in_line_comment:
+                if ch == "\n":
+                    in_line_comment = False
+                i += 1
+                continue
+
+            if not in_single and not in_double and ch == "-" and i + 1 < length and sql[i + 1] == "-":
+                in_line_comment = True
+                i += 2
+                continue
+
+            if ch == "'" and not in_double:
+                if in_single and i + 1 < length and sql[i + 1] == "'":
+                    i += 2
+                    continue
+                in_single = not in_single
+                i += 1
+                continue
+
+            if ch == '"' and not in_single:
+                if in_double and i + 1 < length and sql[i + 1] == '"':
+                    i += 2
+                    continue
+                in_double = not in_double
+                i += 1
+                continue
+
+            if in_single or in_double:
+                i += 1
+                continue
+
+            if ch == "(":
+                opens.append(i)
+            elif ch == ")":
+                closes.append(i)
+
+            i += 1
+
+        return opens, closes
+
     def _strip_outer_select_parentheses(self, sql: str) -> str:
         """仅在顶层 SELECT 被一对括号整体包裹时去掉括号。"""
         trimmed = sql.strip()
@@ -216,10 +299,8 @@ class AstAnalyzer:
     def _replace_cdiwcs_domain(self, sql: str) -> str:
         """
         将 cdiwcs.ly.com 不区分大小写地替换为 iwcs。
-        将 lyerp. 不区分大小写地替换为 erp。
         """
-        sql = re.sub(r"cdiwcs\.ly\.com", "iwcs", sql, flags=re.IGNORECASE)
-        sql = re.sub(r"lyerp\.", "erp.", sql, flags=re.IGNORECASE)
+        sql = re.sub(r"cdiwcs", "iwcs", sql, flags=re.IGNORECASE)
         return sql
 
     def _normalize_dblink_spacing(self, sql: str) -> str:

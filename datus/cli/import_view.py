@@ -73,6 +73,7 @@ class ImportViewRunner:
         self.schema_system_map = {
             "lyerp": "erp",
             "lywms": "wms",
+            "cosmic_pro_secd": "yunuopg_secd"
         }
 
     def run(self) -> Dict[str, Any]:
@@ -346,167 +347,6 @@ class ImportViewRunner:
         logger.info(f"字段命名完成: 已处理视图 {processed}, 跳过 {skipped}, 新增/更新映射 {mapped}")
         return {"processed": processed, "skipped": skipped, "mapped": mapped}
 
-    def analyze_views(self) -> Dict[str, Any]:
-        """解析视图 AST、依赖、标准字段，假设表/视图已同步。"""
-        all_views = self._load_views()
-        view_existing = self._load_existing_view_source()
-
-        to_process: List[ViewSourceRow] = []
-        reused_views: List[ViewSourceRow] = []
-        new_view_ids: List[int] = []
-
-        for view_meta in all_views:
-            row = self._normalize_view(view_meta)
-            key = row.view_name.lower()
-            new_table_id, _ = self._upsert_table_source(row, view_existing.get(key), table_type="VIEW")
-            if new_table_id:
-                row.view_id = new_table_id
-                view_existing[key] = row
-            latest = view_existing.get(key)
-            if latest and not row.view_id:
-                row.view_id = latest.view_id
-            if self.strategy == "incremental" and latest and latest.sql_hash == row.sql_hash:
-                if self._can_skip(latest.view_id):
-                    reused_views.append(latest)
-                    continue
-                reused_views.append(latest)
-                to_process.append(latest)
-                continue
-
-            if not row.view_id:
-                row.view_id = latest.view_id if latest else 0
-            to_process.append(row)
-            if row.view_id:
-                new_view_ids.append(row.view_id)
-
-        view_records = to_process + reused_views
-        if not view_records:
-            return {"new_views": len(new_view_ids), "processed": 0, "failed": 0, "reused": len(reused_views)}
-
-        table_source_map = self._load_table_source_map()
-
-        processed, failed = 0, 0
-        analysis_results: List[Dict[str, Any]] = []
-        for row in view_records:
-            if not row.view_id:
-                logger.warning(f"视图 {row.view_name} 缺少 view_id，跳过解析")
-                continue
-            try:
-                ddl_sql = row.ddl_sql or ""
-                logger.debug(f"待解析视图 {row.view_name} DDL: {ddl_sql}")
-                feature = self.ast.analyze_view(ddl_sql, row.view_name)
-                deps = self._resolve_dependencies(feature, table_source_map, row.db_name)
-                if deps["unresolved"]:
-                    logger.warning(f"视图 {row.view_name} 依赖未解析: {deps['unresolved']}")
-                feature["status"] = "OK"
-                feature["view_dependencies"] = sorted(deps["view_dependencies"])
-                feature["table_dependencies"] = sorted(deps["table_dependencies"])
-                feature["unresolved_dependencies"] = sorted(deps["unresolved"])
-                feature_json = json.dumps(feature, ensure_ascii=True)
-                self._upsert_ai_view_feature(row.view_id, feature_json)
-                self._update_table_parse_status(row.view_id, "PARSED")
-                self._update_node_migration_status(row.view_id, "ANALYZED")
-                view_node_id = self._ensure_view_node(row.view_id, row.view_name)
-                dependency_nodes = self._ensure_dependency_nodes(deps["dep_info"])
-                self._upsert_relations(view_node_id, dependency_nodes, feature, deps["dep_info"])
-                alias_map = {
-                    (t.get("alias") or t.get("resolved_name") or t.get("name")): t for t in feature.get("tables", [])
-                }
-                analysis_results.append(
-                    {
-                        "row": row,
-                        "feature": feature,
-                        "alias_map": alias_map,
-                    }
-                )
-                processed += 1
-            except Exception as exc:  # pragma: no cover
-                logger.error(f"视图解析失败 {row.view_name}: {exc}")
-                error_json = json.dumps({"status": "ERROR", "error": str(exc)}, ensure_ascii=True)
-                self._upsert_ai_view_feature(row.view_id, error_json)
-                self._update_table_parse_status(row.view_id, "FAILED")
-                self._update_node_migration_status(row.view_id, "AST_FAILED")
-                failed += 1
-
-        dep_graph = self._build_view_dep_graph(analysis_results)
-        topo = self._topo_sort(dep_graph)
-        analysis_map = {r["row"].view_name.lower(): r for r in analysis_results}
-
-        # 预取依赖的 node 信息，供 AI/人工判断使用
-        dep_nodes_info = self._load_dep_nodes_info(analysis_results)
-        # 预取依赖的 feature_json（若有历史）
-        dep_features_cache = self._load_dep_features(list(dep_nodes_info.keys()))
-
-        # LLM 延迟初始化
-        if self.llm is None:
-            try:
-                self.llm = LLMBaseModel.create_model(model_name="default", agent_config=self.agent_config)
-            except Exception as exc:  # pragma: no cover
-                logger.warning(f"初始化 LLM 失败，将跳过 AI 分层建议: {exc}")
-                self.llm = None
-
-        print("\n" + "=" * 50)
-        print("开始 AI 辅助数仓分层确认")
-        print("=" * 50 + "\n")
-
-        # 缓存本轮人工确认的层级，供下游视图参考
-        node_layer_cache: Dict[str, str] = {}
-
-        for view_name in topo:
-            result = analysis_map.get(view_name)
-            if not result:
-                continue
-            row = result["row"]
-            feature = result["feature"]
-
-            dependencies_ctx = self._build_dependencies_ctx(
-                feature,
-                dep_nodes_info,
-                dep_features_cache,
-                node_layer_cache,
-            )
-
-            ai_result = {"layer": "OTHER", "description": "", "confidence": 0.0}
-            if self.llm:
-                print(f" 正在分析视图: [cyan]{row.view_name}[/cyan] ...")
-                ai_result = classify_view_layer(
-                    model=self.llm,
-                    view_name=row.view_name,
-                    feature=feature,
-                    dependencies=dependencies_ctx,
-                    ddl_sql=row.ddl_sql,
-                )
-
-            print(f"\n视图: [bold]{row.view_name}[/bold]")
-            dep_names = ", ".join([d.get("name") for d in dependencies_ctx]) if dependencies_ctx else "无"
-            print(f"依赖: {dep_names}")
-            print(
-                f"AI 建议: [green]{ai_result.get('layer', 'OTHER')}[/green] "
-                f"(置信度: {ai_result.get('confidence', 0.0)})"
-            )
-            print(f"AI 描述: {ai_result.get('description', '')}")
-
-            human_layer = self._interactive_confirm_layer(row.view_name, ai_result.get("layer", "OTHER"))
-            node_layer_cache[view_name] = human_layer
-
-            self._update_dw_node_layer_info(
-                view_id=row.view_id,
-                ai_suggest=ai_result.get("layer", "OTHER"),
-                ai_desc=ai_result.get("description", ""),
-                ai_conf=ai_result.get("confidence", 0.0),
-                human_final=human_layer,
-            )
-
-            std_items = self._prepare_std_items(
-                feature,
-                result["alias_map"],
-                row.view_name,
-                row.db_name,
-            )
-            self._persist_std_and_feedback(row.view_name, row.db_name, std_items)
-
-        return {"new_views": len(new_view_ids), "processed": processed, "failed": failed, "reused": len(reused_views)}
-
     def _build_dependencies_ctx(
         self,
         feature: Dict[str, Any],
@@ -620,11 +460,6 @@ class ImportViewRunner:
             key = str(row.get("table_name") or "").lower()
             cache[key] = row.get("feature_json") or ""
         return cache
-
-    def run(self) -> Dict[str, Any]:
-        """兼容旧入口：单库同步后直接解析。"""
-        self.sync_table_and_views()
-        return self.analyze_views()
 
     # ---------- 视图与 hash ---------- #
     def _load_views(self) -> List[Dict[str, str]]:
