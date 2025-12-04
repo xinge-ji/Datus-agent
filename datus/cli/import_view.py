@@ -73,7 +73,8 @@ class ImportViewRunner:
         self.schema_system_map = {
             "lyerp": "erp",
             "lywms": "wms",
-            "cosmic_pro_secd": "yunuopg_secd"
+            "cosmic_pro_secd": "yunuopg_secd",
+            "cosmic_pro_lycus": "yunuopg_lycus"
         }
 
     def run(self) -> Dict[str, Any]:
@@ -809,34 +810,58 @@ class ImportViewRunner:
     # ---------- 新增阶段辅助 ---------- #
     def _load_views_from_meta_for_analysis(self) -> List[Dict[str, Any]]:
         sql = (
-            "SELECT ts.table_id as view_id, ts.table_name as view_name, ts.ddl_sql, ts.parse_status, ts.hash, "
-            "af.feature_json "
+            "SELECT ts.table_id as view_id, ts.table_name as view_name, ts.ddl_sql, ts.parse_status, ts.hash "
             "FROM dw_meta.table_source ts "
-            "LEFT JOIN dw_meta.ai_view_feature af ON ts.table_id = af.table_id "
             f"WHERE ts.source_system = '{self.sourcedb}' AND ts.table_type = 'VIEW'"
         )
         res = self.meta_conn.execute({"sql_query": sql, "result_format": "list"})
         rows = self._rows_from_result(res)
+        if not rows:
+            raw = getattr(res, "sql_return", None)
+            raw_preview = ""
+            if raw is not None:
+                raw_preview = str(raw)
+                if len(raw_preview) > 500:
+                    raw_preview = raw_preview[:500] + "...(truncated)"
+            logger.warning(
+                f"AST 筛选加载结果为空，source_system={self.sourcedb}，success={getattr(res, 'success', None)}, "
+                f"return_type={type(raw).__name__ if raw is not None else 'None'}, preview={raw_preview}"
+            )
         if self.strategy == "overwrite":
             return rows
 
         filtered: List[Dict[str, Any]] = []
+        not_parsed_names: List[str] = []
+        hash_mismatch_names: List[str] = []
         for row in rows:
             status = (row.get("parse_status") or "").upper()
-            current_hash = row.get("hash") or ""
-            feature_json = row.get("feature_json") or ""
-            prev_hash = ""
-            if feature_json:
-                try:
-                    prev_hash = (json.loads(feature_json) or {}).get("source_hash") or ""
-                except Exception:
-                    prev_hash = ""
+            # current_hash = row.get("hash") or ""
+            # feature_json = row.get("feature_json") or ""
+            # prev_hash = ""
+            # if feature_json:
+            #     try:
+            #         prev_hash = (json.loads(feature_json) or {}).get("source_hash") or ""
+            #     except Exception:
+            #         prev_hash = ""
 
             if status != "PARSED":
+                not_parsed_names.append(row.get("view_name") or "")
                 filtered.append(row)
                 continue
-            if not prev_hash or prev_hash != current_hash:
-                filtered.append(row)
+            # if not prev_hash or prev_hash != current_hash:
+            #     hash_mismatch_names.append(row.get("view_name") or "")
+            #     filtered.append(row)
+        if rows:
+            logger.info(
+                f"AST 筛选 (strategy=incremental): 总计={len(rows)}, parse_status!=PARSED={len(not_parsed_names)}, "
+                f"hash 变更/缺失={len(hash_mismatch_names)}, 待处理={len(filtered)}"
+            )
+            sample_np = ", ".join([n for n in not_parsed_names[:10] if n])
+            sample_hash = ", ".join([n for n in hash_mismatch_names[:10] if n])
+            if sample_np:
+                logger.debug(f"待解析视图样例(parse_status!=PARSED): {sample_np}")
+            if sample_hash:
+                logger.debug(f"哈希变更/缺失样例: {sample_hash}")
         return filtered
 
     def _load_nodes_for_classification(self) -> List[Dict[str, Any]]:
@@ -1370,16 +1395,127 @@ class ImportViewRunner:
         if not result or not getattr(result, "success", False):
             return []
         data = getattr(result, "sql_return", None)
+
+        # bytes/bytearray 先解码
+        if isinstance(data, (bytes, bytearray)):
+            try:
+                data = data.decode("utf-8")
+            except Exception:
+                data = data.decode("utf-8", errors="ignore")
+
+        # list[dict]/list[tuple] 直接兜底
         if isinstance(data, list):
             if data and isinstance(data[0], dict):
                 return data
+            if data and isinstance(data[0], (list, tuple)):
+                return [{f"col{i}": v for i, v in enumerate(row)} for row in data]
             return []
+
+        # pyarrow.Table
+        try:
+            if hasattr(data, "to_pylist") and hasattr(data, "column_names"):
+                rows_arrow = data.to_pylist()
+                if rows_arrow:
+                    if isinstance(rows_arrow[0], dict):
+                        return rows_arrow
+                    cols = list(getattr(data, "column_names") or [])
+                    if cols:
+                        converted: List[Dict[str, Any]] = []
+                        for row in rows_arrow:
+                            if isinstance(row, (list, tuple)):
+                                converted.append(dict(zip(cols, row)))
+                            else:
+                                converted.append({cols[0]: row} if cols else {"col0": row})
+                        return converted
+        except Exception:
+            logger.debug("_rows_from_result arrow parse failed", exc_info=True)
+
+        # pandas.DataFrame
+        try:
+            import pandas as pd
+            if isinstance(data, pd.DataFrame):
+                # 替换 NaN 为 None，转为 list[dict]
+                return data.where(pd.notnull(data), None).to_dict('records')
+        except Exception:
+            logger.debug("_rows_from_result pandas parse failed", exc_info=True)
+
+        # tuple 单行兜底
+        if isinstance(data, tuple):
+            return [{f"col{i}": v for i, v in enumerate(data)}]
+
         if isinstance(data, str):
-            try:
-                reader = csv.DictReader(StringIO(data))
-                return [dict(row) for row in reader if row]
-            except Exception:
+            text = data.lstrip("\ufeff").strip()
+            if not text:
                 return []
+
+            # 优先尝试 JSON 解析；失败再尝试 python literal，再按 CSV 解析
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    if parsed and isinstance(parsed[0], dict):
+                        return parsed
+                    return []
+                if isinstance(parsed, dict):
+                    return [parsed]
+            except Exception:
+                pass
+            try:
+                from ast import literal_eval
+
+                parsed = literal_eval(text)
+                if isinstance(parsed, list):
+                    if parsed and isinstance(parsed[0], dict):
+                        return parsed
+                    return []
+                if isinstance(parsed, dict):
+                    return [parsed]
+            except Exception:
+                pass
+
+            def _detect_delimiter(sample_text: str) -> str:
+                try:
+                    sample = "\n".join([ln for ln in sample_text.splitlines() if ln.strip()][:5])
+                    return csv.Sniffer().sniff(sample).delimiter or ","
+                except Exception:
+                    candidates = [",", "\t", "|", ";"]
+                    counts = {sep: sample_text.count(sep) for sep in candidates}
+                    return max(counts, key=counts.get) if counts else ","
+
+            def _csv_to_rows(csv_text: str, delimiter: str) -> List[Dict[str, Any]]:
+                reader = csv.DictReader(StringIO(csv_text, newline=""), delimiter=delimiter)
+                return [dict(row) for row in reader if row]
+
+            delimiter = _detect_delimiter(text)
+            try:
+                rows_csv = _csv_to_rows(text, delimiter)
+                if rows_csv:
+                    return rows_csv
+            except Exception as exc:
+                logger.debug(f"_rows_from_result csv parse error ({exc}), raw length={len(text)}")
+
+            # 兜底：去空行/手动拆分
+            lines = [ln for ln in text.splitlines() if ln.strip()]
+            if len(lines) >= 2:
+                try:
+                    rows_csv2 = _csv_to_rows("\n".join(lines), delimiter)
+                    if rows_csv2:
+                        return rows_csv2
+                except Exception as exc2:
+                    logger.debug(f"_rows_from_result csv line parse error ({exc2}), raw length={len(text)}")
+
+                try:
+                    headers = [p.strip() for p in lines[0].split(delimiter)]
+                    manual_rows: List[Dict[str, Any]] = []
+                    for ln in lines[1:]:
+                        cols = [p.strip() for p in ln.split(delimiter)]
+                        if len(cols) == len(headers):
+                            manual_rows.append(dict(zip(headers, cols)))
+                    if manual_rows:
+                        return manual_rows
+                except Exception:
+                    logger.debug(f"_rows_from_result manual csv parse failed, raw length={len(text)}")
+            logger.debug(f"_rows_from_result csv parse empty, raw length={len(text)}")
+            return []
         return []
 
     def _strip_ansi(self, text: str) -> str:

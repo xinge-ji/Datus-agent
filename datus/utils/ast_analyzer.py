@@ -119,6 +119,7 @@ class AstAnalyzer:
         ddl_body = self._normalize_dblink_spacing(ddl_body)
         ddl_body = self._strip_ly_domain_in_dblink(ddl_body)
         ddl_body = self._replace_cdiwcs_domain(ddl_body)
+        ddl_body = self._rewrite_dblink_to_db_table(ddl_body)
         ddl_body = self._normalize_comparison_operators(ddl_body)
         ddl_body = self._strip_extra_closing_parentheses(ddl_body)
         ddl_body = ddl_body.strip()
@@ -138,6 +139,8 @@ class AstAnalyzer:
             select_match = re.search(r"(?is)\bselect\b", ddl_body)
             if select_match:
                 ddl_body = ddl_body[select_match.start() :].lstrip()
+
+        print(ddl_body)
         return ddl_body
 
     def _normalize_commas_and_parentheses(self, sql: str) -> str:
@@ -194,9 +197,101 @@ class AstAnalyzer:
         return sql
 
     def _strip_ly_domain_in_dblink(self, sql: str) -> str:
-        """仅在跨库表引用中去掉 .ly.com 域名（形如 table@xxx.ly.com -> table@xxx）。"""
-        pattern = re.compile(r"(?i)(\b[A-Za-z_][\w$#]*)@([A-Za-z_][\w$#]*(?:\.[A-Za-z_][\w$#]*)*?)\.ly\.com\b")
-        return pattern.sub(lambda m: f"{m.group(1)}@{m.group(2)}", sql)
+        """仅在跨库表引用中去掉 .ly.com 域名（形如 table@xxx.ly.com 或 "table"@xxx.ly.com -> table@xxx）。"""
+        # 支持 table 和 "table" 两种形式
+        return re.sub(r"\.ly\.com", "", sql)
+
+    def _rewrite_dblink_to_db_table(self, sql: str) -> str:
+        """
+        将 table@db 或 "table"@db 改写为 db.table / db."table"，仅处理引号与行注释外的片段，避免误改字面量。
+        """
+        result: List[str] = []
+        in_single = False
+        in_line_comment = False
+        i = 0
+        length = len(sql)
+
+        while i < length:
+            ch = sql[i]
+
+            if in_line_comment:
+                result.append(ch)
+                if ch == "\n":
+                    in_line_comment = False
+                i += 1
+                continue
+
+            if not in_single and ch == "-" and i + 1 < length and sql[i + 1] == "-":
+                in_line_comment = True
+                result.append(ch)
+                result.append(sql[i + 1])
+                i += 2
+                continue
+
+            if ch == "'":
+                if in_single and i + 1 < length and sql[i + 1] == "'":
+                    result.append("''")
+                    i += 2
+                    continue
+                in_single = not in_single
+                result.append(ch)
+                i += 1
+                continue
+
+            if in_single:
+                result.append(ch)
+                i += 1
+                continue
+
+            ident, end_idx = self._match_identifier_at(sql, i)
+            if ident is not None:
+                j = end_idx
+                while j < length and sql[j].isspace():
+                    j += 1
+                if j < length and sql[j] == "@":
+                    k = j + 1
+                    while k < length and sql[k].isspace():
+                        k += 1
+                    db_ident, db_end_idx = self._match_identifier_at(sql, k)
+                    if db_ident is not None:
+                        result.append(f"{db_ident}.{ident}")
+                        i = db_end_idx
+                        continue
+                result.append(sql[i:end_idx])
+                i = end_idx
+                continue
+
+            result.append(ch)
+            i += 1
+
+        return "".join(result)
+
+    def _match_identifier_at(self, sql: str, index: int) -> tuple[Optional[str], int]:
+        """
+        从指定位置尝试匹配标识符（支持双引号包裹的标识符），返回 (匹配文本, 终止位置)；未匹配返回 (None, index)。
+        """
+        if index >= len(sql):
+            return None, index
+
+        ch = sql[index]
+        if ch == '"':
+            i = index + 1
+            while i < len(sql):
+                if sql[i] == '"':
+                    if i + 1 < len(sql) and sql[i + 1] == '"':
+                        i += 2
+                        continue
+                    return sql[index : i + 1], i + 1
+                i += 1
+            return None, index
+
+        if ch.isalpha() or ch == "_":
+            i = index + 1
+            while i < len(sql) and (sql[i].isalnum() or sql[i] in "_$#"):
+                i += 1
+            return sql[index:i], i
+
+        return None, index
 
     def _strip_extra_closing_parentheses(self, sql: str) -> str:
         """删除多余的右括号（默认出现在末端），忽略字符串和行注释内的括号。"""
@@ -298,9 +393,9 @@ class AstAnalyzer:
 
     def _replace_cdiwcs_domain(self, sql: str) -> str:
         """
-        将 cdiwcs.ly.com 不区分大小写地替换为 iwcs。
+        将 cdiwcs 不区分大小写地替换为 iwcs。
         """
-        sql = re.sub(r"cdiwcs", "iwcs", sql, flags=re.IGNORECASE)
+        sql = re.sub(r"@cdiwcs", "@iwcs", sql, flags=re.IGNORECASE)
         return sql
 
     def _normalize_dblink_spacing(self, sql: str) -> str:
@@ -573,64 +668,47 @@ class AstAnalyzer:
 
         analyzer = AstAnalyzer()
         sql = """CREATE VIEW AS
-         select a.check_time as credate, --任务完成时间
-       a.ssc_picking_carton_id, --IWCS任务明细ID
-       a.wms_inout_id as tradedtlid, --WMS移库细单ID
-       b.inv_owner_id as goodsownerid, --货主ID
-       (select aa.party_name
-          from com_party@cdiwcs.ly.com aa
-         where aa.com_party_type_id = 1
-           and aa.com_party_id = b.inv_owner_id) as goodsownername, --货主名称
-       a.checker as checkerid, --复核人ID
-       c.employeecode as checker, --复核人
-       a.com_goods_id as ownergoodsid, --货主货品ID
-       b.goods_name as goodsname, --货品名称
-       b.english_name as goodsengname, --商品名
-       b.goods_desc as goodstype, --规格
-       (select cc.package_name
-          from com_goods_package@cdiwcs.ly.com cc
-         where cc.com_goods_id = a.com_goods_id
-           and cc.package_type = 'UNIT') as tradepackname, --单位
-       (select dd.party_name
-          from com_party@cdiwcs.ly.com dd
-         where dd.com_party_type_id = 4
-           and dd.com_party_id = b.factory_id) as factname, --生产厂家
-       b.product_location as prodarea, --产地
-       a.com_lot_id as lotid, --批号ID
-       d.lot_no as lotno, --批号
-       a.package_id as ownerpackid, --货主货品包装ID
-       a.package_name as packname, --包装名称
-       a.package_num as packsize, --包装大小
-       a.allocate_qty as goodsqty, --拣货数量
-       f.depot_name, --出库区域
-       decode(a.carton_type,
-              'A',
-              '零散出库',
-              'C',
-              '整箱出库',
-              'P',
-              '托盘出库',
-              0) carton_type, --IWCS任务类型
-       decode(a.carton_type, 'A', 1, 0) as scattercount, --散件条数
-       decode(a.carton_type, 'A', 0, 1) as wholecount, --整件条数
-       decode(a.carton_type, 'A', 0, a.allocate_qty / a.package_num) as wholeqty, --整件件数
-       extract(year from a.check_time) * 12 +
-       extract(month from a.check_time) usermm, --逻辑月
-       extract(day from a.check_time) as useday, --月
-       extract(month from a.check_time) as usemonth, --月
-       extract(year from a.check_time) as useyear --年
-  from ssc_autotoplat_picking@cdiwcs.ly.com a,
-       com_goods@cdiwcs.ly.com              b,
-       sys_userlist                @cdiwcs.ly.com c,
-       com_lot@cdiwcs.ly.com                d,
-       com_stock_pos@cdiwcs.ly.com          e,
-       com_depot@cdiwcs.ly.com              f
- where a.check_status = 'TRUE'
-   and a.checker = c.userid
-   and a.com_goods_id = b.com_goods_id
-   and a.com_lot_id = d.com_lot_id
-   and a.stock_pos_id = e.stock_pos_id
-   and e.depot_id = f.com_depot_id
+         SELECT org."fnumber"          AS "entryid", --独立单元id
+       wh."fnumber"           AS "warehouseid", --仓库id
+       wh."fname"             AS "warehousename", --仓库名称
+       gds."fnumber"          AS "drugCode", --药品编码
+       invs."fqty"            AS "stock", -- 库存
+       invs."fbatch_no"       AS "batchNum", --批号
+       invs."fmanu_date"      AS "prodDate", --生产日期
+       invs."fexpiry_date"    AS "validity", --到期日期
+       gds."fname"            AS "drugName", -- 商品名称
+       gds."fspecs"           AS "pack", -- 商品规格
+       gds."fmanufacturer_cn" AS "factory", -- 生产厂家
+       uni."fname"            AS "unit", -- 单位
+       gds."fbarcode"         AS "barcode", -- 商品条形码
+       gds."fapproval_no"     AS "approval", -- 批准文号
+       tax."fname"            AS "taxRate", -- 税率名称
+
+       null AS "busiType", --经营范围类别
+       remote2."fk_yn_price" AS "price", --价格
+       1    AS "step", --采购倍数 购买增量、步长(数字类型)
+       null AS "midPack", --中包装数
+       null AS "wholePack", --整包装数
+       null AS "recommendedPrice" --建议零售价
+  FROM "rm_gsm_im_inv_balance"@cosmic_pro_secd.ly.com invs --rm_gsm_im_inv_balance是雨诺库存表
+ INNER JOIN "rm_bd_goods"@cosmic_pro_secd.ly.com gds
+    ON invs."fgoods_id" = gds."fid" --rm_bd_goods是雨诺商品表
+ INNER JOIN "ft_t_org_org"@cosmic_pro_secd.ly.com org
+    ON invs."fbizorg_id" = org."fid" --ft_t_org_org是雨诺的组织表(外部)
+ INNER JOIN "rm_bd_warehouse"@cosmic_pro_secd.ly.com wh
+    ON invs."fwarehouse_id" = wh."fid" --rm_bd_warehouse是雨诺的仓库表
+  LEFT JOIN "rm_bd_measureunit"@cosmic_pro_secd.ly.com uni--rm_bd_measureunit是雨诺的单位表
+    ON uni."fid" = gds."fbaseunit_id"
+  LEFT JOIN "rm_bd_tax_rate"@cosmic_pro_secd.ly.com tax
+    ON gds."fsales_taxrate_id" = tax."fid" --rm_bd_tax_rate是雨诺的税率表
+      LEFT JOIN "rm_bd_goods_m"@cosmic_pro_secd.ly.com remote1
+    ON gds."fid" = remote1."fid"
+          LEFT JOIN "tk_yn_mdm_ysb_goods"@cosmic_pro_lycus.ly.com remote2
+    ON remote2."fnumber" = gds."fnumber"
+ WHERE
+--invs."fbizorg_id" = '2113718453792679940' AND fbizorg_id是组织单位,每张表略有不同 这里是entryid=682的fid
+ invs."fqty" > 0
+ and remote1."fisban_online_sales"=0
         """
         features = analyzer.analyze_view(sql)
         print(features)
