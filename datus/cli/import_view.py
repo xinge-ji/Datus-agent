@@ -214,6 +214,8 @@ class ImportViewRunner:
         dep_graph = self._build_graph_from_nodes(nodes_data)
         topo_order = self._topo_sort(dep_graph)
         nodes_map = {n["view_name"].lower(): n for n in nodes_data}
+        
+        logger.info("\n".join(topo_order))
 
         layer_cache = {n["view_name"].lower(): n["human_layer_final"] for n in nodes_data if n.get("human_layer_final")}
         processed = skipped = 0
@@ -568,10 +570,13 @@ class ImportViewRunner:
         返回 (table_id, changed)，changed 表示是否发生了插入/更新。
         """
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        view_name = self._escape(row.view_name)
+        view_name = self._escape(row.view_name).lower()
         ddl_sql = self._escape(row.ddl_sql)
         sql_hash = self._escape(row.sql_hash)
-        source_system = self._escape(row.db_name) if self._escape(row.db_name) != "" else self.sourcedb
+        if table_type == "EXTERNAL":
+            source_system = self._escape(row.db_name) if self._escape(row.db_name) != "" else self.sourcedb
+        else:
+            source_system = self.sourcedb
 
         # 已存在且 hash 未变
         if existing and existing.sql_hash == row.sql_hash:
@@ -653,12 +658,12 @@ class ImportViewRunner:
         return status in {"REVIEWED", "IMPLEMENTED", "SKIPPED"}
 
     # ---------- 依赖解析与 DAG ---------- #
-    def _get_or_create_external_dependency(self, raw_name: str, db_prefix: Optional[str]) -> Optional[Dict[str, Any]]:
+    def _get_or_create_external_dependency(self, view_name: str, raw_name: str, db_prefix: Optional[str]) -> Optional[Dict[str, Any]]:
         """
         处理跨库/DBLink 依赖：映射前缀到目标系统，查询元数据，必要时创建虚拟表。
         """
         target_system = self.sourcedb
-        target_table_name = raw_name
+        target_table_name = raw_name.lower()
         is_virtual = False
 
         # 显式 schema/db 前缀 (如 lyerp.table)
@@ -666,6 +671,11 @@ class ImportViewRunner:
             clean_prefix = str(db_prefix).lower()
             if clean_prefix in self.schema_system_map:
                 target_system = self.schema_system_map[clean_prefix]
+            else:
+                # 未知 db_prefix，当前系统内生成虚拟表，例如 iwcs_table
+                target_system = self.sourcedb
+                target_table_name = f"{clean_prefix}_{target_table_name}"
+                is_virtual = True
 
         # DBLink 风格 (如 table@iwcs)
         if "@" in raw_name:
@@ -700,7 +710,7 @@ class ImportViewRunner:
 
         # 未找到且需要虚拟表时，插入占位 EXTERNAL 节点，保证血缘不断裂
         if is_virtual:
-            logger.info(f"创建虚拟表依赖: system={target_system}, table={target_table_name}")
+            logger.info(f"为 {view_name} 创建虚拟表依赖: system={target_system}, table={target_table_name}")
             virtual_row = ViewSourceRow(
                 view_id=None,
                 view_name=target_table_name,
@@ -729,6 +739,7 @@ class ImportViewRunner:
         unresolved: Set[str] = set()
         dep_info: Dict[str, Dict[str, Any]] = {}
         tables = feature.get("tables") or []
+        view_name = feature.get("view_name")
         for t in tables:
             alias = t.get("alias") or t.get("name") or ""
             raw_name = t.get("name") or ""
@@ -743,7 +754,7 @@ class ImportViewRunner:
                 info = table_source_map.get(dep_key)
             # 跨库或缓存未命中时尝试外部解析/虚拟表
             if not info:
-                external_info = self._get_or_create_external_dependency(raw_name, db_prefix)
+                external_info = self._get_or_create_external_dependency(view_name, raw_name, db_prefix)
                 if external_info:
                     info = external_info
                     resolved_name = external_info.get("resolved_name") or resolved_name
@@ -909,7 +920,11 @@ class ImportViewRunner:
         graph: Dict[str, Set[str]] = {}
         for n in nodes:
             name = n["view_name"].lower()
-            feature = json.loads(n["feature_json"]) if n.get("feature_json") else {}
+            try:
+                feature = json.loads(n["feature_json"]) if n.get("feature_json") else {}
+            except Exception:
+                logger.info(f"{name} has bad json: {n['feature_json']}")
+                raise Exception
             deps = set([d.lower() for d in feature.get("view_dependencies", [])])
             graph[name] = deps
         return graph

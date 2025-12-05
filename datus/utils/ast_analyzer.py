@@ -474,7 +474,7 @@ class AstAnalyzer:
                     output_name = proj.alias_or_name or proj.sql(dialect=self.dialect)
                     expr = proj
 
-                expr_sql = expr.sql(dialect=self.dialect)
+                expr_sql = self._strip_outer_quotes(expr.sql(dialect=self.dialect))
                 source_alias, source_col = self._extract_source_column(expr)
                 is_group_key = expr_sql in group_keys
                 is_aggregated = False
@@ -499,6 +499,12 @@ class AstAnalyzer:
 
         return columns
 
+    def _strip_outer_quotes(self, s: str) -> str:
+        s = s.strip()
+        if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+            s = s[1:-1]
+        return re.sub(r'(?<!\\)"', r'\\\"', s)
+    
     def _extract_source_column(self, expr: exp.Expression) -> tuple[Optional[str], Optional[str]]:
         if isinstance(expr, exp.Column):
             return expr.table, expr.name
