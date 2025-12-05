@@ -503,7 +503,7 @@ class AstAnalyzer:
         s = s.strip()
         if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
             s = s[1:-1]
-        return re.sub(r'(?<!\\)"', r'\\\"', s)
+        return re.sub(r'(?<!\\)"', r'\\"', s)
     
     def _extract_source_column(self, expr: exp.Expression) -> tuple[Optional[str], Optional[str]]:
         if isinstance(expr, exp.Column):

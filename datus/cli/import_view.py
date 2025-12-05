@@ -923,6 +923,9 @@ class ImportViewRunner:
             try:
                 feature = json.loads(n["feature_json"]) if n.get("feature_json") else {}
             except Exception:
+                val = n["feature_json"]  # 在报错前插桩或 REPL 读取
+                print(repr(val[360:430]))
+                print([hex(ord(c)) for c in val[360:410]])
                 logger.info(f"{name} has bad json: {n['feature_json']}")
                 raise Exception
             deps = set([d.lower() for d in feature.get("view_dependencies", [])])
