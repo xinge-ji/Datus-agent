@@ -503,8 +503,11 @@ class AstAnalyzer:
         s = s.strip()
         if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
             s = s[1:-1]
-        return re.sub(r'(?<!\\)"', r'\\"', s)
-    
+        s = re.sub(r'(?<!\\)"', r'\\"', s)
+        CTRL_RE = re.compile(r"[\x00-\x1f]")  # JSON 不允许的控制字符
+        s = CTRL_RE.sub(" ", s)
+        return re.sub(r"/\*.*?\*/", "", s, flags=re.DOTALL) # 删除 /* */ 注释
+
     def _extract_source_column(self, expr: exp.Expression) -> tuple[Optional[str], Optional[str]]:
         if isinstance(expr, exp.Column):
             return expr.table, expr.name
@@ -515,7 +518,7 @@ class AstAnalyzer:
             return c.table, c.name
         return None, None
 
-    def _collect_joins(self, root: exp.Expression) -> List[JoinInfo]:
+    def _collect_joins(self, root: exp.Expression) -> List[JoinInfo]
         joins: List[JoinInfo] = []
 
         for select in root.find_all(exp.Select):

@@ -157,6 +157,8 @@ class ImportViewRunner:
             parse_status = (row.get("parse_status") or "").upper()
             current_hash = row.get("hash") or ""
             prev_hash = self._get_feature_hash(view_id)
+            
+            logger.info(f"Processing {view_name}")
 
             if (
                 self.strategy == "incremental"
