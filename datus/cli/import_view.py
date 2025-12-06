@@ -213,8 +213,9 @@ class ImportViewRunner:
         if not nodes_data:
             return {"processed": 0, "skipped": 0}
 
-        dep_graph = self._build_graph_from_nodes(nodes_data)
-        topo_order = self._topo_sort(dep_graph)
+        table_type_map = {k: v.get("table_type") for k, v in self._load_table_source_map().items()}
+        dep_graph, priority_map = self._build_graph_from_nodes(nodes_data, table_type_map)
+        topo_order = self._topo_sort(dep_graph, priority_map)
         nodes_map = {n["view_name"].lower(): n for n in nodes_data}
         
         logger.info("\n".join(topo_order))
@@ -227,10 +228,7 @@ class ImportViewRunner:
             if not node:
                 continue
 
-            if (
-                self.strategy == "incremental"
-                and node.get("migration_status") in ["REVIEWED", "IMPLEMENTED"]
-            ):
+            if self.strategy == "incremental" and not node.get("_need_process", True):
                 skipped += 1
                 continue
 
@@ -795,21 +793,28 @@ class ImportViewRunner:
             graph[view_nm] = {d for d in deps if d in view_set}
         return graph
 
-    def _topo_sort(self, graph: Dict[str, Set[str]]) -> List[str]:
+    def _topo_sort(self, graph: Dict[str, Set[str]], priority_map: Optional[Dict[str, int]] = None) -> List[str]:
         indeg: Dict[str, int] = {k: 0 for k in graph}
         for deps in graph.values():
             for dep in deps:
                 if dep in indeg:
                     indeg[dep] += 1
         queue = [k for k, v in indeg.items() if v == 0]
+        if priority_map:
+            queue.sort(key=lambda x: priority_map.get(x, 2))
         order: List[str] = []
         while queue:
             node = queue.pop(0)
             order.append(node)
             for dep in graph.get(node, []):
+                if dep not in indeg:
+                    logger.debug(f"拓扑排序忽略未知依赖: {node} -> {dep}")
+                    continue
                 indeg[dep] -= 1
                 if indeg[dep] == 0:
                     queue.append(dep)
+                    if priority_map:
+                        queue.sort(key=lambda x: priority_map.get(x, 2))
         if len(order) < len(graph):
             logger.warning(f"检测到循环依赖，剩余未排序节点: {set(graph) - set(order)}")
             for k in graph:
@@ -888,14 +893,14 @@ class ImportViewRunner:
             "FROM dw_meta.dw_node n "
             "LEFT JOIN dw_meta.ai_view_feature f ON n.source_table_id = f.table_id "
             "LEFT JOIN dw_meta.table_source t ON n.source_table_id = t.table_id "
-            f"WHERE n.source_system = '{self.sourcedb}' AND n.node_type = 'VIEW'"
+            f"WHERE n.source_system = '{self.sourcedb}' AND n.node_type = 'VIEW' "
+            "AND t.table_type = 'VIEW' AND t.parse_status = 'PARSED'"
         )
         res = self.meta_conn.execute({"sql_query": sql, "result_format": "list"})
         rows = self._rows_from_result(res)
         if self.strategy == "overwrite":
             return rows
 
-        filtered: List[Dict[str, Any]] = []
         success_status = {"REVIEWED", "IMPLEMENTED", "SKIPPED"}
         for row in rows:
             status = (row.get("migration_status") or "").upper()
@@ -908,18 +913,17 @@ class ImportViewRunner:
                 except Exception:
                     prev_hash = ""
 
-            if status not in success_status:
-                filtered.append(row)
-                continue
+            need_process = True
+            if self.strategy == "incremental" and status in success_status and prev_hash and current_hash and prev_hash == current_hash:
+                need_process = False
 
-            # 成功但内容有更新/缺少特征时需要重跑
-            if not prev_hash or (current_hash and prev_hash != current_hash):
-                filtered.append(row)
+            row["_need_process"] = need_process
+        return rows
 
-        return filtered
-
-    def _build_graph_from_nodes(self, nodes: List[Dict[str, Any]]) -> Dict[str, Set[str]]:
+    def _build_graph_from_nodes(self, nodes: List[Dict[str, Any]], type_map: Dict[str, Optional[str]]) -> Tuple[Dict[str, Set[str]], Dict[str, int]]:
+        node_set = {n["view_name"].lower() for n in nodes}
         graph: Dict[str, Set[str]] = {}
+        priority: Dict[str, int] = {}
         for n in nodes:
             name = n["view_name"].lower()
             try:
@@ -931,8 +935,48 @@ class ImportViewRunner:
                 logger.info(f"{name} has bad json: {n['feature_json']}")
                 raise Exception
             deps = set([d.lower() for d in feature.get("view_dependencies", [])])
-            graph[name] = deps
-        return graph
+            missing = {d for d in deps if d not in node_set}
+            if missing:
+                logger.debug(f"忽略未纳入分层的依赖: {name} -> {missing}")
+            graph[name] = {d for d in deps if d in node_set}
+            priority[name] = self._calc_dep_priority(feature, type_map, missing)
+        return graph, priority
+
+    def _calc_dep_priority(self, feature: Dict[str, Any], type_map: Dict[str, Optional[str]], missing_view_deps: Set[str]) -> int:
+        deps_view = {d.lower() for d in feature.get("view_dependencies", [])}
+        deps_table = {d.lower() for d in feature.get("table_dependencies", [])}
+        unresolved = {d.lower() for d in feature.get("unresolved_dependencies", [])}
+
+        contains_view = False
+        contains_external = False
+
+        for v in deps_view:
+            t_type = (type_map.get(v) or "").upper()
+            if t_type == "VIEW":
+                contains_view = True
+            elif t_type == "EXTERNAL" or not t_type:
+                contains_external = True
+
+        for t in deps_table:
+            t_type = (type_map.get(t) or "").upper()
+            if t_type == "EXTERNAL" or not t_type:
+                contains_external = True
+
+        for mv in missing_view_deps:
+            t_type = (type_map.get(mv) or "").upper()
+            if t_type == "VIEW":
+                contains_view = True
+            elif t_type == "EXTERNAL" or not t_type:
+                contains_external = True
+
+        if unresolved:
+            contains_external = True
+
+        if contains_external:
+            return 3
+        if contains_view:
+            return 2
+        return 1
 
     def _get_feature_hash(self, view_id: Optional[int]) -> str:
         if not view_id:
