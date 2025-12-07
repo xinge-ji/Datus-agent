@@ -1530,30 +1530,68 @@ class ImportViewRunner:
             f"WHERE LOWER(std_field_name) = LOWER('{std_name}') "
             "ORDER BY std_field_id DESC LIMIT 1"
         )
-        fetch = self.meta_conn.execute({"sql_query": select_sql})
+        source_system = self._escape(item.get("source_system") or self.sourcedb)
+        select_sql = (
+            "SELECT std_field_id FROM dw_meta.std_field "
+            f"WHERE LOWER(std_field_name) = LOWER('{std_name}') "
+            f"AND source_system = '{source_system}' "
+            "ORDER BY std_field_id DESC LIMIT 1"
+        )
+
+        logger.info(f"[STD] 查找 std_field: name={std_name_raw}, source_system={source_system}")
+        fetch = self.meta_conn.execute({"sql_query": select_sql, "result_format": "list"})
         rows = self._rows_from_result(fetch)
         if rows:
             return int(rows[0].get("std_field_id"))
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         insert = (
             "INSERT INTO dw_meta.std_field "
-            "(std_field_name, std_field_name_cn, data_type_std, default_agg, is_active, created_at, updated_at) "
+            "(std_field_name, std_field_name_cn, data_type_std, default_agg, is_active, source_system, created_at, updated_at) "
             f"VALUES ('{std_name}', '{std_name_cn}', '{data_type_std}', "
-            f"'none', 1, '{now}', '{now}')"
+            f"'none', 1, '{source_system}', '{now}', '{now}')"
         )
-        self.meta_conn.execute({"sql_query": insert})
-        res = self.meta_conn.execute({"sql_query": select_sql})
+        logger.info(f"[STD] 插入 std_field: name={std_name_raw}, cn={item['std_field_name_cn']}, type={data_type_std}")
+        insert_res = self.meta_conn.execute({"sql_query": insert})
+        if not insert_res or not getattr(insert_res, "success", False):
+            raw_ret = getattr(insert_res, "sql_return", "")
+            raise RuntimeError(f"std_field 插入失败: {std_name_raw}, 原始返回={raw_ret}")
+
+        logger.info(f"[STD] 插入后再次查询 std_field: name={std_name_raw}")
+        res = self.meta_conn.execute({"sql_query": select_sql, "result_format": "list"})
         rows2 = self._rows_from_result(res)
         if rows2:
             return int(rows2[0].get("std_field_id"))
         # 再做一次兜底查询，避免大小写或事务延迟问题
         res_fb = self.meta_conn.execute(
-            {"sql_query": "SELECT std_field_id FROM dw_meta.std_field ORDER BY std_field_id DESC LIMIT 1"}
+            {
+                "sql_query": (
+                    "SELECT std_field_id FROM dw_meta.std_field "
+                    f"WHERE source_system = '{source_system}' "
+                    "ORDER BY std_field_id DESC LIMIT 1"
+                ),
+                "result_format": "list",
+            }
         )
         rows_fb = self._rows_from_result(res_fb)
         if rows_fb:
             return int(rows_fb[0].get("std_field_id"))
-        raise RuntimeError(f"无法获取 std_field_id: {std_name_raw}")
+        # 追加诊断信息
+        count_res = self.meta_conn.execute(
+            {
+                "sql_query": (
+                    "SELECT COUNT(1) AS cnt FROM dw_meta.std_field "
+                    f"WHERE source_system = '{source_system}'"
+                ),
+                "result_format": "list",
+            }
+        )
+        cnt_rows = self._rows_from_result(count_res)
+        cnt_val = cnt_rows[0].get("cnt") if cnt_rows else "unknown"
+        raw_select = getattr(res, "sql_return", None)
+        raw_insert = getattr(insert_res, "sql_return", None)
+        raise RuntimeError(
+            f"无法获取 std_field_id: {std_name_raw}, source_system={source_system}, count={cnt_val}, select_raw={raw_select}, insert_raw={raw_insert}"
+        )
 
     def _upsert_std_mapping(self, std_field_id: int, item: Dict[str, str]):
         source_system = item.get("source_system") or self.sourcedb
