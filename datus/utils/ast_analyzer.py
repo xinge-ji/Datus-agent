@@ -33,6 +33,7 @@ class ColumnInfo:
     is_aggregated: bool
     is_group_key: bool
     is_window: bool = False
+    referenced_columns: List[Dict[str, Optional[str]]] = None
 
 
 @dataclass
@@ -494,6 +495,7 @@ class AstAnalyzer:
                         is_aggregated=is_aggregated,
                         is_group_key=is_group_key,
                         is_window=is_window,
+                        referenced_columns=self._extract_referenced_columns(expr),
                     )
                 )
 
@@ -509,6 +511,20 @@ class AstAnalyzer:
         s = re.sub(r"/\*.*?\*/", "", s, flags=re.DOTALL) # 删除 /* */ 注释
         s = s.strip()
         return s
+
+    def _extract_referenced_columns(self, expr: exp.Expression) -> List[Dict[str, Optional[str]]]:
+        """
+        抽取表达式中出现的所有列，统一返回表别名与列名的小写组合。
+        """
+        refs: List[Dict[str, Optional[str]]] = []
+        for col in expr.find_all(exp.Column):
+            refs.append(
+                {
+                    "table_alias": (col.table or "").lower() if col.table else None,
+                    "column": (col.name or "").lower() if col.name else None,
+                }
+            )
+        return refs
 
     def _extract_source_column(self, expr: exp.Expression) -> tuple[Optional[str], Optional[str]]:
         if isinstance(expr, exp.Column):

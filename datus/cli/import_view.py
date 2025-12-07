@@ -16,6 +16,7 @@ from datus.tools.llms_tools.classify_layer import classify_view_layer
 from rich.prompt import Prompt
 from datus.tools.db_tools.db_manager import DBManager
 from datus.utils.ast_analyzer import AstAnalyzer
+from datus.utils.field_equivalence import FieldNode, FieldResolver, UnionFind
 from datus.utils.constants import DBType
 from datus.utils.loggings import get_logger
 from datus.utils.sql_utils import normalize_sql, parse_table_name_parts
@@ -277,7 +278,7 @@ class ImportViewRunner:
         return {"processed": processed, "skipped": skipped}
 
     def run_naming(self) -> Dict[str, int]:
-        """阶段4：AI+人工确认标准化字段命名。"""
+        """阶段4：基于字段等价关系的标准化命名。"""
         logger.info(">>> 阶段 4: 开始字段命名 ...")
         if self.llm is None:
             try:
@@ -286,69 +287,212 @@ class ImportViewRunner:
                 logger.warning(f"LLM 初始化失败: {exc}")
                 return {"error": "LLM init failed"}
 
-        views = self._load_views_for_naming()
-        if not views:
+        view_features = self._load_view_features_for_naming()
+        if not view_features:
             return {"processed": 0, "skipped": 0, "mapped": 0}
 
-        processed = skipped = mapped = 0
-        existing_std_names = self._load_existing_std_names()
-
-        for row in views:
-            view_name = row.get("view_name") or ""
-            view_hash = row.get("hash") or ""
+        feature_map: Dict[str, Dict[str, Any]] = {}
+        for row in view_features:
+            view_name = (row.get("view_name") or "").lower()
             feature_json = row.get("feature_json") or ""
-            feature = json.loads(feature_json) if feature_json else {}
+            try:
+                feature = json.loads(feature_json) if feature_json else {}
+            except Exception as exc:
+                logger.warning(f"解析视图特征失败 {view_name}: {exc}")
+                continue
+            if not feature:
+                continue
+            feature["view_name"] = view_name
+            feature_map[view_name] = feature
 
-            if not feature.get("columns"):
-                logger.info(f"视图 {view_name} 缺少字段信息，跳过命名")
-                skipped += 1
+        if not feature_map:
+            return {"processed": 0, "skipped": 0, "mapped": 0}
+
+        table_source_index = self._load_table_source_index()
+        resolver = FieldResolver(feature_map=feature_map, table_source_index=table_source_index, default_source_system=self.sourcedb)
+        uf = UnionFind()
+        self._build_field_graph(feature_map, resolver, uf)
+
+        groups = uf.groups()
+        if not groups:
+            return {"processed": 0, "skipped": 0, "mapped": 0}
+
+        existing_std_names = self._load_existing_std_names()
+        existing_mappings = self._load_existing_std_mappings()
+
+        processed = 0
+        mapped = 0
+        skipped = 0
+
+        for _, node_keys in groups.items():
+            if not node_keys:
                 continue
 
-            if self.strategy == "incremental":
-                has_mapping = self._has_existing_mapping(view_name)
-                feature_hash = feature.get("source_hash")
-                if has_mapping and feature_hash and feature_hash == view_hash:
-                    skipped += 1
-                    continue
+            std_id, conflict_ids = self._select_existing_std_id(node_keys, existing_mappings)
+            if conflict_ids:
+                logger.warning(f"分组存在多个 std_field_id，优先复用 {std_id}，其它={conflict_ids}")
 
-            if self.strategy == "overwrite":
-                self._delete_std_mapping(view_name)
-
-            alias_map = {(t.get("alias") or t.get("resolved_name") or t.get("name")): t for t in feature.get("tables", [])}
-
-            for col in feature.get("columns") or []:
-                std_en, std_cn = self._suggest_std_field_names(
-                    view_name=view_name,
-                    column=col,
-                    banned_names=existing_std_names,
-                )
-                std_en, std_cn = self._interactive_confirm_naming(view_name, col.get("output_name") or col.get("source_column") or "", std_en, std_cn)
-                existing_std_names.add(std_en)
+            if not std_id:
+                suggest_en, suggest_cn = self._suggest_group_std_field_name(node_keys, existing_std_names)
+                suggest_en, suggest_cn = self._interactive_confirm_group_naming(node_keys, suggest_en, suggest_cn)
+                existing_std_names.add(suggest_en)
                 std_id = self._get_or_create_std_field(
                     {
-                        "std_field_name": std_en,
-                        "std_field_name_cn": std_cn,
+                        "std_field_name": suggest_en,
+                        "std_field_name_cn": suggest_cn,
                         "data_type_std": "string",
                     }
                 )
-                source_alias = col.get("source_table_alias")
-                source_table = view_name
-                if source_alias and source_alias in alias_map:
-                    table_meta = alias_map[source_alias]
-                    source_table = table_meta.get("resolved_name") or table_meta.get("name") or view_name
+
+            for node_key in node_keys:
+                node = FieldNode.from_key(node_key)
                 item = {
-                    "source_db": row.get("db_name") or self.sourcedb,
-                    "source_table": source_table,
-                    "source_column": col.get("source_column") or (col.get("output_name") or ""),
-                    "expression_sql": col.get("expression_sql") or "",
+                    "source_system": node.source_system,
+                    "source_db": "",
+                    "source_table": node.table,
+                    "source_column": node.column,
+                    "expression_sql": "",
                 }
                 self._upsert_std_mapping(std_id, item)
                 mapped += 1
 
             processed += 1
 
-        logger.info(f"字段命名完成: 已处理视图 {processed}, 跳过 {skipped}, 新增/更新映射 {mapped}")
+        logger.info(f"字段命名完成: 分组 {processed}, 跳过 {skipped}, 新增/更新映射 {mapped}")
         return {"processed": processed, "skipped": skipped, "mapped": mapped}
+
+    def _build_field_graph(self, feature_map: Dict[str, Dict[str, Any]], resolver: FieldResolver, uf: UnionFind):
+        for view_name, feature in feature_map.items():
+            # 收集列使用的源节点
+            for col in feature.get("columns") or []:
+                nodes = resolver.resolve_column_feature(view_name, feature, col)
+                for node in nodes:
+                    uf.add(node.key)
+
+            # 收集 JOIN/WHERE 等值条件带来的等价边
+            for join in feature.get("joins") or []:
+                for cond in join.get("conditions") or []:
+                    left_nodes = resolver.resolve_alias(
+                        view_name, feature, cond.get("left_table_alias"), cond.get("left_column")
+                    )
+                    right_nodes = resolver.resolve_alias(
+                        view_name, feature, cond.get("right_table_alias"), cond.get("right_column")
+                    )
+                    for node in left_nodes + right_nodes:
+                        uf.add(node.key)
+                    for ln in left_nodes:
+                        for rn in right_nodes:
+                            uf.union(ln.key, rn.key)
+
+    def _load_view_features_for_naming(self) -> List[Dict[str, Any]]:
+        """
+        加载所有已解析视图的特征，用于跨视图字段等价图构建。
+        """
+        sql = (
+            "SELECT ts.table_id as view_id, ts.table_name as view_name, ts.hash, af.feature_json "
+            "FROM dw_meta.table_source ts "
+            "LEFT JOIN dw_meta.ai_view_feature af ON ts.table_id = af.table_id "
+            f"WHERE ts.source_system = '{self._escape(self.sourcedb)}' "
+            "AND ts.table_type = 'VIEW' AND ts.parse_status = 'PARSED'"
+        )
+        res = self.meta_conn.execute({"sql_query": sql, "result_format": "list"})
+        rows = self._rows_from_result(res)
+        return rows
+
+    def _load_table_source_index(self) -> Dict[Tuple[str, str], Dict[str, Any]]:
+        """
+        返回 (source_system, table_name)->table 信息的索引，全部小写。
+        """
+        sql = "SELECT table_id, table_name, table_type, source_system FROM dw_meta.table_source"
+        res = self.meta_conn.execute({"sql_query": sql, "result_format": "list"})
+        rows = self._rows_from_result(res)
+        mapping: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for row in rows:
+            ss = str(row.get("source_system") or "").lower()
+            name = str(row.get("table_name") or "").lower()
+            mapping[(ss, name)] = {
+                "table_id": row.get("table_id"),
+                "table_name": name,
+                "table_type": (row.get("table_type") or "").upper(),
+                "source_system": ss,
+            }
+        return mapping
+
+    def _load_existing_std_mappings(self) -> Dict[str, int]:
+        """
+        返回节点键 -> std_field_id 映射，节点键格式 source_system.table.column（均小写）。
+        """
+        sql = "SELECT source_system, source_table, source_column, std_field_id FROM dw_meta.std_field_mapping WHERE is_active = 1"
+        res = self.meta_conn.execute({"sql_query": sql, "result_format": "list"})
+        rows = self._rows_from_result(res)
+        mapping: Dict[str, int] = {}
+        for row in rows:
+            ss = str(row.get("source_system") or "").lower()
+            tbl = str(row.get("source_table") or "").lower()
+            col = str(row.get("source_column") or "").lower()
+            key = f"{ss}.{tbl}.{col}"
+            try:
+                mapping[key] = int(row.get("std_field_id"))
+            except Exception:
+                continue
+        return mapping
+
+    def _select_existing_std_id(self, node_keys: Set[str], existing_mappings: Dict[str, int]) -> Tuple[Optional[int], Set[int]]:
+        ids: List[int] = []
+        for key in node_keys:
+            sid = existing_mappings.get(key)
+            if sid:
+                ids.append(sid)
+        if not ids:
+            return None, set()
+        main = ids[0]
+        return main, set(ids[1:])
+
+    def _suggest_group_std_field_name(self, node_keys: Set[str], banned_names: Set[str]) -> Tuple[str, str]:
+        sample_nodes = sorted(list(node_keys))[:10]
+        default_en = node_keys and FieldNode.from_key(next(iter(node_keys))).column or "field"
+        default_cn = default_en
+        if not self.llm:
+            return default_en, default_cn
+
+        prompt = (
+            "你是数仓标准字段命名助手，以下字段在业务上等价，请给出统一的英文蛇形命名和中文名。\n"
+            "字段列表（source_system.table.column）：\n"
+            + "\n".join(sample_nodes)
+            + "\n禁止使用的英文名: "
+            + ", ".join(list(banned_names)[:20])
+            + "\n输出 JSON，键为 std_field_name, std_field_name_cn，不要包含其他文本。"
+        )
+
+        for _ in range(3):
+            resp = self.llm.generate(prompt)
+            parsed = self._extract_json_dict(resp)
+            std_en = self._to_snake(parsed.get("std_field_name") or default_en)
+            std_cn = parsed.get("std_field_name_cn") or default_cn
+            if std_en and std_en not in banned_names:
+                return std_en, std_cn
+            prompt += f"\n请重新生成，避免使用: {std_en}"
+        return default_en, default_cn
+
+    def _interactive_confirm_group_naming(self, node_keys: Set[str], suggest_en: str, suggest_cn: str) -> Tuple[str, str]:
+        sample = ", ".join(sorted(list(node_keys))[:5])
+        prompt_text = (
+            f"确认分组命名（示例字段: {sample}）\n"
+            f"默认英文: {suggest_en}, 默认中文: {suggest_cn}\n"
+            "如需修改，请输入 英文,中文（逗号分隔），直接回车接受默认: "
+        )
+        try:
+            user_input = input(prompt_text)
+        except Exception:
+            return suggest_en, suggest_cn
+        if not user_input:
+            return suggest_en, suggest_cn
+        parts = [p.strip() for p in user_input.split(",") if p.strip()]
+        if len(parts) == 1:
+            return self._to_snake(parts[0]), suggest_cn
+        if len(parts) >= 2:
+            return self._to_snake(parts[0]), parts[1]
+        return suggest_en, suggest_cn
 
     def _build_dependencies_ctx(
         self,
@@ -540,6 +684,7 @@ class ImportViewRunner:
             mapping[name] = {
                 "table_id": row.get("table_id"),
                 "table_type": (row.get("table_type") or "").upper(),
+                "source_system": self.sourcedb,
             }
         return mapping
 
@@ -704,6 +849,7 @@ class ImportViewRunner:
                 "table_type": (rows[0].get("table_type") or "").upper(),
                 "resolved_name": target_table_name,
                 "db_name": "",
+                "source_system": target_system,
             }
         else:
             is_virtual = True
@@ -724,6 +870,7 @@ class ImportViewRunner:
                 "table_type": "EXTERNAL",
                 "resolved_name": target_table_name,
                 "db_name": "",
+                "source_system": target_system,
             }
 
         return None
@@ -765,11 +912,13 @@ class ImportViewRunner:
                 dep_type = "VIEW" if t_type == "VIEW" else "TABLE"
                 t["source_type"] = dep_type
                 t["resolved_name"] = resolved_name
+                t["source_system"] = info.get("source_system", self.sourcedb)
                 dep_info[alias_key] = {
                     "name": resolved_name,
                     "db_name": info.get("db_name", db_name),
                     "type": dep_type,
                     "source_table_id": info.get("table_id"),
+                    "source_system": info.get("source_system", self.sourcedb),
                 }
                 if dep_type == "VIEW":
                     view_deps.add(dep_key)
@@ -1407,9 +1556,10 @@ class ImportViewRunner:
         raise RuntimeError(f"无法获取 std_field_id: {item['std_field_name']}")
 
     def _upsert_std_mapping(self, std_field_id: int, item: Dict[str, str]):
+        source_system = item.get("source_system") or self.sourcedb
         delete = (
             "DELETE FROM dw_meta.std_field_mapping "
-            f"WHERE source_system = '{self.sourcedb}' "
+            f"WHERE source_system = '{self._escape(source_system)}' "
             f"AND source_db = '{self._escape(item['source_db'])}' "
             f"AND source_table = '{self._escape(item['source_table'])}' "
             f"AND source_column = '{self._escape(item['source_column'])}'"
@@ -1422,7 +1572,7 @@ class ImportViewRunner:
             "(source_system, source_db, source_table, source_column, source_column_comment, source_data_type, "
             "std_field_id, transform_expr, is_primary_key, is_business_key, is_partition_key, is_active, remark, "
             "created_at, updated_at) "
-            f"VALUES ('{self.sourcedb}', '{self._escape(item['source_db'])}', '{self._escape(item['source_table'])}', "
+            f"VALUES ('{self._escape(source_system)}', '{self._escape(item['source_db'])}', '{self._escape(item['source_table'])}', "
             f"'{self._escape(item['source_column'])}', '', NULL, {std_field_id}, '{expr}', "
             "0, 0, 0, 1, 'auto-generated', "
             f"'{now}', '{now}')"

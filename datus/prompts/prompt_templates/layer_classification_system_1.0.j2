@@ -9,11 +9,11 @@ Layers definition:
 Instructions:
 1. Analyze the view's logic (aggregations imply DWS, simple mappings imply ODS/DWD).
 2. Look at dependencies. If it depends on other DWS/DIM, it's likely DWS.
-3. Provide a brief description of what business logic this view represents.
+3. Provide a brief description of what business logic this view represents in Chinese.
 
 Output JSON format:
 {
     "layer": "DIM" | "DWD" | "DWS" | "OTHER",
     "confidence": 0.0 to 1.0,
-    "description": "Concise business description of this view (max 50 words). e.g. 'Aggregates daily sales by store.'"
+    "description": "Concise business description of this view in Chinese (max 50 words)."
 }
