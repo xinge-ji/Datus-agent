@@ -1523,13 +1523,6 @@ class ImportViewRunner:
         std_name_raw = self._to_snake(item["std_field_name"])
         std_name = self._escape(std_name_raw)
         std_name_cn = self._escape(item["std_field_name_cn"])
-        data_type_std = self._escape(item["data_type_std"])
-
-        select_sql = (
-            "SELECT std_field_id FROM dw_meta.std_field "
-            f"WHERE LOWER(std_field_name) = LOWER('{std_name}') "
-            "ORDER BY std_field_id DESC LIMIT 1"
-        )
         source_system = self._escape(item.get("source_system") or self.sourcedb)
         select_sql = (
             "SELECT std_field_id FROM dw_meta.std_field "
@@ -1546,11 +1539,10 @@ class ImportViewRunner:
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         insert = (
             "INSERT INTO dw_meta.std_field "
-            "(std_field_name, std_field_name_cn, data_type_std, default_agg, is_active, source_system, created_at, updated_at) "
-            f"VALUES ('{std_name}', '{std_name_cn}', '{data_type_std}', "
-            f"'none', 1, '{source_system}', '{now}', '{now}')"
+            "(std_field_name, std_field_name_cn, source_system, semantic_type, created_at, updated_at) "
+            f"VALUES ('{std_name}', '{std_name_cn}', '{source_system}', NULL, '{now}', '{now}')"
         )
-        logger.info(f"[STD] 插入 std_field: name={std_name_raw}, cn={item['std_field_name_cn']}, type={data_type_std}")
+        logger.info(f"[STD] 插入 std_field: name={std_name_raw}, cn={item['std_field_name_cn']}, source_system={source_system}")
         insert_res = self.meta_conn.execute({"sql_query": insert})
         if not insert_res or not getattr(insert_res, "success", False):
             raw_ret = getattr(insert_res, "sql_return", "")
