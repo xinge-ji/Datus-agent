@@ -1536,14 +1536,16 @@ class ImportViewRunner:
         rows = self._rows_from_result(fetch)
         if rows:
             return int(rows[0].get("std_field_id"))
-        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         insert = (
             "INSERT INTO dw_meta.std_field "
-            "(std_field_name, std_field_name_cn, source_system, semantic_type, created_at, updated_at) "
-            f"VALUES ('{std_name}', '{std_name_cn}', '{source_system}', NULL, '{now}', '{now}')"
+            "(std_field_name, std_field_name_cn, source_system, semantic_type) "
+            f"VALUES ('{std_name}', '{std_name_cn}', '{source_system}', NULL)"
         )
         logger.info(f"[STD] 插入 std_field: name={std_name_raw}, cn={item['std_field_name_cn']}, source_system={source_system}")
         insert_res = self.meta_conn.execute({"sql_query": insert})
+        logger.info(
+            f"[STD] 插入结果: success={getattr(insert_res, 'success', None)}, return={getattr(insert_res, 'sql_return', None)}"
+        )
         if not insert_res or not getattr(insert_res, "success", False):
             raw_ret = getattr(insert_res, "sql_return", "")
             raise RuntimeError(f"std_field 插入失败: {std_name_raw}, 原始返回={raw_ret}")
@@ -1568,6 +1570,16 @@ class ImportViewRunner:
         if rows_fb:
             return int(rows_fb[0].get("std_field_id"))
         # 追加诊断信息
+        res_all = self.meta_conn.execute(
+            {
+                "sql_query": (
+                    "SELECT std_field_id, std_field_name, source_system "
+                    "FROM dw_meta.std_field ORDER BY std_field_id DESC LIMIT 5"
+                ),
+                "result_format": "list",
+            }
+        )
+        rows_all = self._rows_from_result(res_all)
         count_res = self.meta_conn.execute(
             {
                 "sql_query": (
@@ -1582,7 +1594,8 @@ class ImportViewRunner:
         raw_select = getattr(res, "sql_return", None)
         raw_insert = getattr(insert_res, "sql_return", None)
         raise RuntimeError(
-            f"无法获取 std_field_id: {std_name_raw}, source_system={source_system}, count={cnt_val}, select_raw={raw_select}, insert_raw={raw_insert}"
+            f"无法获取 std_field_id: {std_name_raw}, source_system={source_system}, count={cnt_val}, "
+            f"select_raw={raw_select}, insert_raw={raw_insert}, rows_all={rows_all}"
         )
 
     def _upsert_std_mapping(self, std_field_id: int, item: Dict[str, str]):
