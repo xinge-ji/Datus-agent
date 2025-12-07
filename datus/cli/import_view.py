@@ -1520,21 +1520,21 @@ class ImportViewRunner:
             self.meta_conn.execute({"sql_query": feedback_sql})
 
     def _get_or_create_std_field(self, item: Dict[str, str]) -> int:
-        fetch = self.meta_conn.execute(
-            {
-                "sql_query": (
-                    "SELECT std_field_id FROM dw_meta.std_field "
-                    f"WHERE std_field_name = '{self._escape(item['std_field_name'])}' LIMIT 1"
-                )
-            }
+        std_name_raw = self._to_snake(item["std_field_name"])
+        std_name = self._escape(std_name_raw)
+        std_name_cn = self._escape(item["std_field_name_cn"])
+        data_type_std = self._escape(item["data_type_std"])
+
+        select_sql = (
+            "SELECT std_field_id FROM dw_meta.std_field "
+            f"WHERE LOWER(std_field_name) = LOWER('{std_name}') "
+            "ORDER BY std_field_id DESC LIMIT 1"
         )
+        fetch = self.meta_conn.execute({"sql_query": select_sql})
         rows = self._rows_from_result(fetch)
         if rows:
             return int(rows[0].get("std_field_id"))
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        std_name = self._escape(item["std_field_name"])
-        std_name_cn = self._escape(item["std_field_name_cn"])
-        data_type_std = self._escape(item["data_type_std"])
         insert = (
             "INSERT INTO dw_meta.std_field "
             "(std_field_name, std_field_name_cn, data_type_std, default_agg, is_active, created_at, updated_at) "
@@ -1542,18 +1542,18 @@ class ImportViewRunner:
             f"'none', 1, '{now}', '{now}')"
         )
         self.meta_conn.execute({"sql_query": insert})
-        res = self.meta_conn.execute(
-            {
-                "sql_query": (
-                    "SELECT std_field_id FROM dw_meta.std_field "
-                    f"WHERE std_field_name = '{std_name}' ORDER BY std_field_id DESC LIMIT 1"
-                )
-            }
-        )
+        res = self.meta_conn.execute({"sql_query": select_sql})
         rows2 = self._rows_from_result(res)
         if rows2:
             return int(rows2[0].get("std_field_id"))
-        raise RuntimeError(f"无法获取 std_field_id: {item['std_field_name']}")
+        # 再做一次兜底查询，避免大小写或事务延迟问题
+        res_fb = self.meta_conn.execute(
+            {"sql_query": "SELECT std_field_id FROM dw_meta.std_field ORDER BY std_field_id DESC LIMIT 1"}
+        )
+        rows_fb = self._rows_from_result(res_fb)
+        if rows_fb:
+            return int(rows_fb[0].get("std_field_id"))
+        raise RuntimeError(f"无法获取 std_field_id: {std_name_raw}")
 
     def _upsert_std_mapping(self, std_field_id: int, item: Dict[str, str]):
         source_system = item.get("source_system") or self.sourcedb
