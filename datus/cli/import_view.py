@@ -26,11 +26,13 @@ logger = get_logger(__name__)
 
 @dataclass
 class ViewSourceRow:
-    view_id: Optional[int]
+    view_id: int
     view_name: str
     db_name: str
     ddl_sql: str
     sql_hash: str
+    has_row: int = 0
+    parse_status: str = None
 
 
 class ImportViewRunner:
@@ -110,6 +112,7 @@ class ImportViewRunner:
 
         for tbl in all_tables:
             row = self._normalize_view(tbl)
+            row.has_row = self._check_has_data(tbl)
             key = row.view_name.lower()
             existing = table_existing.get(key)
             table_id, changed = self._upsert_table_source(row, existing, table_type="TABLE")
@@ -125,6 +128,8 @@ class ImportViewRunner:
 
         for view_meta in all_views:
             row = self._normalize_view(view_meta)
+            row.has_row = self._check_has_data(view_meta)
+            row.parse_status = "SKIPPED" if not row.has_row else "NEW"
             key = row.view_name.lower()
             existing = view_existing.get(key)
             view_id, changed = self._upsert_table_source(row, existing, table_type="VIEW")
@@ -158,7 +163,12 @@ class ImportViewRunner:
             parse_status = (row.get("parse_status") or "").upper()
             current_hash = row.get("hash") or ""
             prev_hash = self._get_feature_hash(view_id)
-            
+
+            if parse_status == "SKIPPED":
+                skipped += 1
+                logger.info(f"跳过 AST（parse_status=SKIPPED）: {view_name}")
+                continue
+
             logger.info(f"Processing {view_name}")
 
             if (
@@ -317,7 +327,6 @@ class ImportViewRunner:
         if not groups:
             return {"processed": 0, "skipped": 0, "mapped": 0}
 
-        existing_std_names = self._load_existing_std_names()
         existing_mappings = self._load_existing_std_mappings()
 
         processed = 0
@@ -333,9 +342,8 @@ class ImportViewRunner:
                 logger.warning(f"分组存在多个 std_field_id，优先复用 {std_id}，其它={conflict_ids}")
 
             if not std_id:
-                suggest_en, suggest_cn = self._suggest_group_std_field_name(node_keys, existing_std_names)
+                suggest_en, suggest_cn = self._suggest_group_std_field_name(node_keys, set())
                 suggest_en, suggest_cn = self._interactive_confirm_group_naming(node_keys, suggest_en, suggest_cn)
-                existing_std_names.add(suggest_en)
                 std_id = self._get_or_create_std_field(
                     {
                         "std_field_name": suggest_en,
@@ -475,7 +483,7 @@ class ImportViewRunner:
         return default_en, default_cn
 
     def _interactive_confirm_group_naming(self, node_keys: Set[str], suggest_en: str, suggest_cn: str) -> Tuple[str, str]:
-        sample = ", ".join(sorted(list(node_keys))[:5])
+        sample = ", ".join(sorted(list(node_keys)))
         prompt_text = (
             f"确认分组命名（示例字段: {sample}）\n"
             f"默认英文: {suggest_en}, 默认中文: {suggest_cn}\n"
@@ -650,9 +658,58 @@ class ImportViewRunner:
             sql_hash=sql_hash,
         )
 
+    def _get_source_dialect(self) -> str:
+        return str(getattr(self.source_conn, "dialect", "") or getattr(self.agent_config, "db_type", "") or "").lower()
+
+    def _compose_full_table_name(self, table_meta: Dict[str, str]) -> str:
+        raw_name = table_meta.get("table_name") or table_meta.get("view_name") or table_meta.get("name") or ""
+        if not raw_name:
+            return ""
+        if "." in raw_name:
+            return raw_name
+        db_name = table_meta.get("database_name") or table_meta.get("db_name") or self.source_db_name or ""
+        schema_name = (
+            table_meta.get("schema_name")
+            or table_meta.get("schema")
+            or table_meta.get("owner")
+            or self.source_schema
+            or ""
+        )
+        parts = [p for p in [db_name, schema_name, raw_name] if p]
+        return ".".join(parts) if parts else raw_name
+
+    def _build_probe_sql(self, full_table_name: str) -> str:
+        dialect = self._get_source_dialect()
+        if dialect in {DBType.SQLSERVER.value, DBType.MSSQL.value}:
+            return f"SELECT TOP 1 1 FROM {full_table_name}"
+        if dialect == DBType.ORACLE.value:
+            return f"SELECT 1 FROM {full_table_name} WHERE ROWNUM <= 1"
+        return f"SELECT 1 FROM {full_table_name} LIMIT 1"
+
+    def _check_has_data(self, table_meta: Dict[str, str]) -> int:
+        full_table_name = self._compose_full_table_name(table_meta)
+        if not full_table_name:
+            raise ValueError(f"源对象缺少名称，无法检查是否有数据: {table_meta}")
+        sql = self._build_probe_sql(full_table_name)
+        if not hasattr(self.source_conn, "execute"):
+            raise RuntimeError("源连接不支持 execute，无法检查是否有数据")
+        try:
+            res = self.source_conn.execute({"sql_query": sql, "result_format": "list"})
+        except Exception as exc:
+            raise RuntimeError(f"检测 {full_table_name} 是否有数据失败: {exc}") from exc
+
+        if not res or not getattr(res, "success", False):
+            err = getattr(res, "error", "未知错误")
+            raise RuntimeError(f"检测 {full_table_name} 是否有数据失败: {err}")
+        err_detail = getattr(res, "error", None)
+        if err_detail:
+            raise RuntimeError(f"检测 {full_table_name} 是否有数据失败: {err_detail}")
+        rows = self._rows_from_result(res)
+        return 1 if rows else 0
+
     def _load_existing_view_source(self) -> Dict[str, ViewSourceRow]:
         sql = (
-            "SELECT table_id as view_id, table_name as view_name, '' as db_name, ddl_sql, hash "
+            "SELECT table_id as view_id, table_name as view_name, '' as db_name, ddl_sql, hash, has_row, parse_status "
             "FROM dw_meta.table_source "
             f"WHERE source_system = '{self.sourcedb}' AND table_type = 'VIEW'"
         )
@@ -661,12 +718,18 @@ class ImportViewRunner:
         existing: Dict[str, ViewSourceRow] = {}
         for row in rows:
             key = str(row.get("view_name", "")).lower()
+            try:
+                has_row_val = int(row.get("has_row")) if row.get("has_row") is not None else None
+            except Exception:
+                has_row_val = row.get("has_row")
             existing[key] = ViewSourceRow(
                 view_id=row.get("view_id"),
                 view_name=row.get("view_name", ""),
                 db_name="",
                 ddl_sql=row.get("ddl_sql", ""),
                 sql_hash=row.get("hash", "") or "",
+                has_row=has_row_val,
+                parse_status=row.get("parse_status"),
             )
         return existing
 
@@ -690,7 +753,7 @@ class ImportViewRunner:
 
     def _load_existing_table_source(self, table_type: str = "VIEW") -> Dict[str, ViewSourceRow]:
         sql = (
-            "SELECT table_id as view_id, table_name as view_name, '' as db_name, ddl_sql, hash "
+            "SELECT table_id as view_id, table_name as view_name, '' as db_name, ddl_sql, hash, has_row, parse_status "
             "FROM dw_meta.table_source "
             f"WHERE source_system = '{self.sourcedb}' AND table_type = '{table_type}'"
         )
@@ -699,12 +762,18 @@ class ImportViewRunner:
         existing: Dict[str, ViewSourceRow] = {}
         for row in rows:
             key = str(row.get("view_name", "")).lower()
+            try:
+                has_row_val = int(row.get("has_row")) if row.get("has_row") is not None else None
+            except Exception:
+                has_row_val = row.get("has_row")
             existing[key] = ViewSourceRow(
                 view_id=row.get("view_id"),
                 view_name=row.get("view_name", ""),
                 db_name="",
                 ddl_sql=row.get("ddl_sql", ""),
                 sql_hash=row.get("hash", "") or "",
+                has_row=has_row_val,
+                parse_status=row.get("parse_status"),
             )
         return existing
 
@@ -718,21 +787,34 @@ class ImportViewRunner:
         view_name = self._escape(row.view_name).lower()
         ddl_sql = self._escape(row.ddl_sql)
         sql_hash = self._escape(row.sql_hash)
+        has_row = 1 if row.has_row else 0
+        requested_status = (row.parse_status or "").upper()
+        existing_status = (existing.parse_status or "").upper() if existing else ""
+        target_status = requested_status or existing_status or "NEW"
+        if not requested_status and existing_status == "SKIPPED" and has_row:
+            # 数据恢复后将 SKIPPED 恢复为 NEW，后续可重新进入 AST
+            target_status = "NEW"
+        target_status_esc = self._escape(target_status)
         if table_type == "EXTERNAL":
             source_system = self._escape(row.db_name) if self._escape(row.db_name) != "" else self.sourcedb
         else:
             source_system = self.sourcedb
 
-        # 已存在且 hash 未变
-        if existing and existing.sql_hash == row.sql_hash:
-            return existing.view_id or 0, False
-
-        # 已存在但 hash 变化 -> 更新
         if existing and existing.view_id:
+            update_fields: List[str] = []
+            if existing.sql_hash != row.sql_hash:
+                update_fields.extend([f"ddl_sql = '{ddl_sql}'", f"hash = '{sql_hash}'"])
+            if existing.has_row != has_row:
+                update_fields.append(f"has_row = {has_row}")
+            if target_status != existing_status:
+                update_fields.append(f"parse_status = '{target_status_esc}'")
+            if not update_fields:
+                return existing.view_id or 0, False
+            update_fields.append(f"updated_at = '{now}'")
             update_sql = (
                 "UPDATE dw_meta.table_source SET "
-                f"ddl_sql = '{ddl_sql}', hash = '{sql_hash}', updated_at = '{now}' "
-                f"WHERE table_id = {existing.view_id}"
+                + ", ".join(update_fields)
+                + f" WHERE table_id = {existing.view_id}"
             )
             self.meta_conn.execute({"sql_query": update_sql})
             return existing.view_id, True
@@ -740,8 +822,8 @@ class ImportViewRunner:
         # 新增
         insert = (
             "INSERT INTO dw_meta.table_source "
-            "(source_system, table_name, table_type, ddl_sql, hash, created_at, updated_at) "
-            f"VALUES ('{source_system}', '{view_name}', '{table_type}', '{ddl_sql}', '{sql_hash}', '{now}', '{now}')"
+            "(source_system, table_name, table_type, ddl_sql, hash, has_row, parse_status, created_at, updated_at) "
+            f"VALUES ('{source_system}', '{view_name}', '{table_type}', '{ddl_sql}', '{sql_hash}', {has_row}, '{target_status_esc}', '{now}', '{now}')"
         )
         self.meta_conn.execute({"sql_query": insert})
         res = self.meta_conn.execute(
@@ -1532,10 +1614,6 @@ class ImportViewRunner:
         )
 
         logger.info(f"[STD] 查找 std_field: name={std_name_raw}, source_system={source_system}")
-        fetch = self.meta_conn.execute({"sql_query": select_sql, "result_format": "list"})
-        rows = self._rows_from_result(fetch)
-        if rows:
-            return int(rows[0].get("std_field_id"))
         insert = (
             "INSERT INTO dw_meta.std_field "
             "(std_field_name, std_field_name_cn, source_system, semantic_type) "
