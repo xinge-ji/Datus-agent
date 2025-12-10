@@ -675,13 +675,13 @@ class ImportViewRunner:
             or self.source_schema
             or ""
         )
-        parts = [p for p in [db_name, schema_name, raw_name] if p]
+        parts = [p for p in [schema_name, raw_name] if p]
         return ".".join(parts) if parts else raw_name
 
     def _build_probe_sql(self, full_table_name: str) -> str:
         dialect = self._get_source_dialect()
         if "oracle" in dialect:
-            return f"SELECT 1 FROM {full_table_name} WHERE ROWNUM <= 1"
+            return f"SELECT 1 FROM {full_table_name} WHERE ROWNUM = 1"
         if "sqlserver" in dialect or "mssql" in dialect:
             return f"SELECT TOP 1 1 FROM {full_table_name}"
         return f"SELECT 1 FROM {full_table_name} LIMIT 1"
