@@ -680,10 +680,10 @@ class ImportViewRunner:
 
     def _build_probe_sql(self, full_table_name: str) -> str:
         dialect = self._get_source_dialect()
-        if dialect in {DBType.SQLSERVER.value, DBType.MSSQL.value}:
-            return f"SELECT TOP 1 1 FROM {full_table_name}"
-        if dialect == DBType.ORACLE.value:
+        if "oracle" in dialect:
             return f"SELECT 1 FROM {full_table_name} WHERE ROWNUM <= 1"
+        if "sqlserver" in dialect or "mssql" in dialect:
+            return f"SELECT TOP 1 1 FROM {full_table_name}"
         return f"SELECT 1 FROM {full_table_name} LIMIT 1"
 
     def _check_has_data(self, table_meta: Dict[str, str]) -> int:
@@ -696,14 +696,14 @@ class ImportViewRunner:
         try:
             res = self.source_conn.execute({"sql_query": sql, "result_format": "list"})
         except Exception as exc:
-            raise RuntimeError(f"检测 {full_table_name} 是否有数据失败: {exc}") from exc
+            raise RuntimeError(f"检测 {full_table_name} 是否有数据失败, SQL=[{sql}]: {exc}") from exc
 
         if not res or not getattr(res, "success", False):
             err = getattr(res, "error", "未知错误")
-            raise RuntimeError(f"检测 {full_table_name} 是否有数据失败: {err}")
+            raise RuntimeError(f"检测 {full_table_name} 是否有数据失败, SQL=[{sql}]: {err}")
         err_detail = getattr(res, "error", None)
         if err_detail:
-            raise RuntimeError(f"检测 {full_table_name} 是否有数据失败: {err_detail}")
+            raise RuntimeError(f"检测 {full_table_name} 是否有数据失败, SQL=[{sql}]: {err_detail}")
         rows = self._rows_from_result(res)
         return 1 if rows else 0
 
