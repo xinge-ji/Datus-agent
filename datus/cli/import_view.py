@@ -711,7 +711,7 @@ class ImportViewRunner:
         sql = (
             "SELECT table_id as view_id, table_name as view_name, '' as db_name, ddl_sql, hash, has_row, parse_status "
             "FROM dw_meta.table_source "
-            f"WHERE source_system = '{self.sourcedb}' AND table_type = 'VIEW'"
+            f"WHERE LOWER(source_system) = LOWER('{self.sourcedb}') AND table_type = 'VIEW'"
         )
         result = self.meta_conn.execute({"sql_query": sql, "result_format": "list"})
         rows = self._rows_from_result(result)
@@ -737,7 +737,7 @@ class ImportViewRunner:
         sql = (
             "SELECT table_id, table_name, table_type "
             "FROM dw_meta.table_source "
-            f"WHERE source_system = '{self.sourcedb}'"
+            f"WHERE LOWER(source_system) = LOWER('{self.sourcedb}')"
         )
         result = self.meta_conn.execute({"sql_query": sql, "result_format": "list"})
         rows = self._rows_from_result(result)
@@ -755,7 +755,7 @@ class ImportViewRunner:
         sql = (
             "SELECT table_id as view_id, table_name as view_name, '' as db_name, ddl_sql, hash, has_row, parse_status "
             "FROM dw_meta.table_source "
-            f"WHERE source_system = '{self.sourcedb}' AND table_type = '{table_type}'"
+            f"WHERE LOWER(source_system) = LOWER('{self.sourcedb}') AND table_type = '{table_type}'"
         )
         result = self.meta_conn.execute({"sql_query": sql, "result_format": "list"})
         rows = self._rows_from_result(result)
@@ -781,7 +781,7 @@ class ImportViewRunner:
         sql = (
             "SELECT table_id as view_id, table_name as view_name, '' as db_name, ddl_sql, hash, has_row, parse_status "
             "FROM dw_meta.table_source "
-            f"WHERE source_system = '{source_system}' AND table_type = '{table_type}' "
+            f"WHERE LOWER(source_system) = LOWER('{source_system}') AND table_type = '{table_type}' "
             f"AND LOWER(table_name) = LOWER('{view_name}') "
             "ORDER BY table_id DESC LIMIT 1"
         )
@@ -817,11 +817,12 @@ class ImportViewRunner:
         has_row = 1 if row.has_row else 0
         requested_status = (row.parse_status or "").upper()
         if table_type == "EXTERNAL":
-            source_system = self._escape(row.db_name) if self._escape(row.db_name) != "" else self.sourcedb
+            source_system_raw = self._escape(row.db_name) if self._escape(row.db_name) != "" else self.sourcedb
         else:
-            source_system = self.sourcedb
+            source_system_raw = self.sourcedb
+        source_system_norm = self._escape(source_system_raw).lower()
 
-        existing_row = existing or self._find_existing_in_db(view_name, table_type, source_system)
+        existing_row = existing or self._find_existing_in_db(view_name, table_type, source_system_norm)
         existing_status = (existing_row.parse_status or "").upper() if existing_row else ""
         target_status = requested_status or existing_status or "NEW"
         if not requested_status and existing_status == "SKIPPED" and has_row:
@@ -852,14 +853,14 @@ class ImportViewRunner:
         insert = (
             "INSERT INTO dw_meta.table_source "
             "(source_system, table_name, table_type, ddl_sql, hash, has_row, parse_status, created_at, updated_at) "
-            f"VALUES ('{source_system}', '{view_name}', '{table_type}', '{ddl_sql}', '{sql_hash}', {has_row}, '{target_status_esc}', '{now}', '{now}')"
+            f"VALUES ('{source_system_norm}', '{view_name}', '{table_type}', '{ddl_sql}', '{sql_hash}', {has_row}, '{target_status_esc}', '{now}', '{now}')"
         )
         self.meta_conn.execute({"sql_query": insert})
         res = self.meta_conn.execute(
             {
                 "sql_query": (
                     "SELECT table_id FROM dw_meta.table_source "
-                    f"WHERE source_system = '{source_system}' AND table_type = '{table_type}' "
+                    f"WHERE LOWER(source_system) = LOWER('{source_system_norm}') AND table_type = '{table_type}' "
                     f"AND LOWER(table_name) = LOWER('{view_name}') "
                     "ORDER BY table_id DESC LIMIT 1"
                 )
