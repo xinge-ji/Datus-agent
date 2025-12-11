@@ -112,7 +112,10 @@ class ImportViewRunner:
 
         for tbl in all_tables:
             row = self._normalize_view(tbl)
-            row.has_row = self._check_has_data(tbl)
+            has_row, status_override = self._check_has_data(tbl)
+            row.has_row = has_row
+            if status_override:
+                row.parse_status = status_override
             key = row.view_name.lower()
             existing = table_existing.get(key)
             table_id, changed = self._upsert_table_source(row, existing, table_type="TABLE")
@@ -128,8 +131,9 @@ class ImportViewRunner:
 
         for view_meta in all_views:
             row = self._normalize_view(view_meta)
-            row.has_row = self._check_has_data(view_meta)
-            row.parse_status = "SKIPPED" if not row.has_row else "NEW"
+            has_row, status_override = self._check_has_data(view_meta)
+            row.has_row = has_row
+            row.parse_status = status_override or ("SKIPPED" if not row.has_row else None)
             key = row.view_name.lower()
             existing = view_existing.get(key)
             view_id, changed = self._upsert_table_source(row, existing, table_type="VIEW")
@@ -686,7 +690,7 @@ class ImportViewRunner:
             return f"SELECT TOP 1 1 FROM {full_table_name}"
         return f"SELECT 1 FROM {full_table_name} LIMIT 1"
 
-    def _check_has_data(self, table_meta: Dict[str, str]) -> int:
+    def _check_has_data(self, table_meta: Dict[str, str]) -> Tuple[int, Optional[str]]:
         full_table_name = self._compose_full_table_name(table_meta)
         if not full_table_name:
             raise ValueError(f"源对象缺少名称，无法检查是否有数据: {table_meta}")
@@ -696,16 +700,33 @@ class ImportViewRunner:
         try:
             res = self.source_conn.execute({"sql_query": sql, "result_format": "list"})
         except Exception as exc:
+            if "ORA-16000" in str(exc).upper():
+                logger.warning(
+                    f"检测 {full_table_name} 遇到 ORA-16000（只读库），跳过探测，默认 has_row=1 parse_status=NEW，SQL=[{sql}]"
+                )
+                return 1, "NEW"
             raise RuntimeError(f"检测 {full_table_name} 是否有数据失败, SQL=[{sql}]: {exc}") from exc
 
         if not res or not getattr(res, "success", False):
             err = getattr(res, "error", "未知错误")
+            err_upper = str(err).upper()
+            if "ORA-16000" in err_upper:
+                logger.warning(
+                    f"检测 {full_table_name} 遇到 ORA-16000（只读库），跳过探测，默认 has_row=1 parse_status=NEW，SQL=[{sql}]"
+                )
+                return 1, "NEW"
             raise RuntimeError(f"检测 {full_table_name} 是否有数据失败, SQL=[{sql}]: {err}")
         err_detail = getattr(res, "error", None)
         if err_detail:
+            err_upper = str(err_detail).upper()
+            if "ORA-16000" in err_upper:
+                logger.warning(
+                    f"检测 {full_table_name} 遇到 ORA-16000（只读库），跳过探测，默认 has_row=1 parse_status=NEW，SQL=[{sql}]"
+                )
+                return 1, "NEW"
             raise RuntimeError(f"检测 {full_table_name} 是否有数据失败, SQL=[{sql}]: {err_detail}")
         rows = self._rows_from_result(res)
-        return 1 if rows else 0
+        return (1 if rows else 0), None
 
     def _load_existing_view_source(self) -> Dict[str, ViewSourceRow]:
         sql = (
