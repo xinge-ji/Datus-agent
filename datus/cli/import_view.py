@@ -782,7 +782,7 @@ class ImportViewRunner:
             "SELECT table_id as view_id, table_name as view_name, '' as db_name, ddl_sql, hash, has_row, parse_status "
             "FROM dw_meta.table_source "
             f"WHERE source_system = '{source_system}' AND table_type = '{table_type}' "
-            f"AND table_name = '{view_name}' "
+            f"AND LOWER(table_name) = LOWER('{view_name}') "
             "ORDER BY table_id DESC LIMIT 1"
         )
         res = self.meta_conn.execute({"sql_query": sql, "result_format": "list"})
@@ -859,7 +859,8 @@ class ImportViewRunner:
             {
                 "sql_query": (
                     "SELECT table_id FROM dw_meta.table_source "
-                    f"WHERE source_system = '{source_system}' AND table_name = '{view_name}' "
+                    f"WHERE source_system = '{source_system}' AND table_type = '{table_type}' "
+                    f"AND LOWER(table_name) = LOWER('{view_name}') "
                     "ORDER BY table_id DESC LIMIT 1"
                 )
             }
