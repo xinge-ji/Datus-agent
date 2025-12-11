@@ -777,6 +777,33 @@ class ImportViewRunner:
             )
         return existing
 
+    def _find_existing_in_db(self, view_name: str, table_type: str, source_system: str) -> Optional[ViewSourceRow]:
+        sql = (
+            "SELECT table_id as view_id, table_name as view_name, '' as db_name, ddl_sql, hash, has_row, parse_status "
+            "FROM dw_meta.table_source "
+            f"WHERE source_system = '{source_system}' AND table_type = '{table_type}' "
+            f"AND table_name = '{view_name}' "
+            "ORDER BY table_id DESC LIMIT 1"
+        )
+        res = self.meta_conn.execute({"sql_query": sql, "result_format": "list"})
+        rows = self._rows_from_result(res)
+        if not rows:
+            return None
+        row = rows[0]
+        try:
+            has_row_val = int(row.get("has_row")) if row.get("has_row") is not None else None
+        except Exception:
+            has_row_val = row.get("has_row")
+        return ViewSourceRow(
+            view_id=row.get("view_id"),
+            view_name=row.get("view_name", ""),
+            db_name="",
+            ddl_sql=row.get("ddl_sql", ""),
+            sql_hash=row.get("hash", "") or "",
+            has_row=has_row_val,
+            parse_status=row.get("parse_status"),
+        )
+
     def _upsert_table_source(
         self, row: ViewSourceRow, existing: Optional[ViewSourceRow], table_type: str = "VIEW"
     ) -> Tuple[int, bool]:
@@ -789,35 +816,37 @@ class ImportViewRunner:
         sql_hash = self._escape(row.sql_hash)
         has_row = 1 if row.has_row else 0
         requested_status = (row.parse_status or "").upper()
-        existing_status = (existing.parse_status or "").upper() if existing else ""
-        target_status = requested_status or existing_status or "NEW"
-        if not requested_status and existing_status == "SKIPPED" and has_row:
-            # 数据恢复后将 SKIPPED 恢复为 NEW，后续可重新进入 AST
-            target_status = "NEW"
-        target_status_esc = self._escape(target_status)
         if table_type == "EXTERNAL":
             source_system = self._escape(row.db_name) if self._escape(row.db_name) != "" else self.sourcedb
         else:
             source_system = self.sourcedb
 
-        if existing and existing.view_id:
+        existing_row = existing or self._find_existing_in_db(view_name, table_type, source_system)
+        existing_status = (existing_row.parse_status or "").upper() if existing_row else ""
+        target_status = requested_status or existing_status or "NEW"
+        if not requested_status and existing_status == "SKIPPED" and has_row:
+            # 数据恢复后将 SKIPPED 恢复为 NEW，后续可重新进入 AST
+            target_status = "NEW"
+        target_status_esc = self._escape(target_status)
+
+        if existing_row and existing_row.view_id:
             update_fields: List[str] = []
-            if existing.sql_hash != row.sql_hash:
+            if existing_row.sql_hash != row.sql_hash:
                 update_fields.extend([f"ddl_sql = '{ddl_sql}'", f"hash = '{sql_hash}'"])
-            if existing.has_row != has_row:
+            if (existing_row.has_row or 0) != has_row:
                 update_fields.append(f"has_row = {has_row}")
             if target_status != existing_status:
                 update_fields.append(f"parse_status = '{target_status_esc}'")
             if not update_fields:
-                return existing.view_id or 0, False
+                return existing_row.view_id or 0, False
             update_fields.append(f"updated_at = '{now}'")
             update_sql = (
                 "UPDATE dw_meta.table_source SET "
                 + ", ".join(update_fields)
-                + f" WHERE table_id = {existing.view_id}"
+                + f" WHERE table_id = {existing_row.view_id}"
             )
             self.meta_conn.execute({"sql_query": update_sql})
-            return existing.view_id, True
+            return existing_row.view_id, True
 
         # 新增
         insert = (
@@ -830,7 +859,7 @@ class ImportViewRunner:
             {
                 "sql_query": (
                     "SELECT table_id FROM dw_meta.table_source "
-                    f"WHERE source_system = '{self.sourcedb}' AND table_name = '{view_name}' "
+                    f"WHERE source_system = '{source_system}' AND table_name = '{view_name}' "
                     "ORDER BY table_id DESC LIMIT 1"
                 )
             }
