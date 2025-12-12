@@ -811,9 +811,16 @@ class ImportViewRunner:
         if not isinstance(keys, (list, tuple)):
             keys = [keys]
         if isinstance(row, dict):
+            # 精确匹配
             for k in keys:
                 if k in row and row.get(k) is not None:
                     return row.get(k)
+            # 不区分大小写匹配
+            lower_map = {str(k).lower(): v for k, v in row.items()}
+            for k in keys:
+                lk = str(k).lower()
+                if lk in lower_map and lower_map[lk] is not None:
+                    return lower_map[lk]
             if idx is not None:
                 col_key = f"col{idx}"
                 if col_key in row:
