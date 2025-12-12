@@ -822,3 +822,55 @@ def normalize_sql(sql: str) -> str:
     # 3) Remove the spaces at both ends
     s = s.strip()
     return s
+
+
+def escape_sql(value: str) -> str:
+    """
+    SQL字符串转义，处理单引号。
+
+    从 import_view.py._escape 迁移而来。
+
+    Args:
+        value: 需要转义的字符串
+
+    Returns:
+        转义后的字符串
+
+    Examples:
+        >>> escape_sql("O'Reilly")
+        "O''Reilly"
+        >>> escape_sql("It's a test")
+        "It''s a test"
+    """
+    return (value or "").replace("'", "''")
+
+
+def build_probe_sql(full_table_name: str, dialect: str = "generic") -> str:
+    """
+    构建探测表是否存在的SQL语句。
+
+    从 import_view.py._build_probe_sql 迁移而来。
+
+    Args:
+        full_table_name: 完整的表名
+        dialect: SQL方言，支持 oracle, sqlserver, mssql 等
+
+    Returns:
+        探测SQL语句
+
+    Examples:
+        >>> build_probe_sql("users", "mysql")
+        'SELECT 1 FROM users LIMIT 1'
+        >>> build_probe_sql("users", "oracle")
+        'SELECT 1 FROM users WHERE ROWNUM < 2'
+        >>> build_probe_sql("users", "sqlserver")
+        'SELECT TOP 1 1 FROM users'
+    """
+    dialect_lower = str(dialect).lower()
+
+    if "oracle" in dialect_lower:
+        return f"SELECT 1 FROM {full_table_name} WHERE ROWNUM < 2"
+    elif "sqlserver" in dialect_lower or "mssql" in dialect_lower:
+        return f"SELECT TOP 1 1 FROM {full_table_name}"
+    else:
+        return f"SELECT 1 FROM {full_table_name} LIMIT 1"
