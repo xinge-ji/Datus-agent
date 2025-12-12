@@ -741,7 +741,7 @@ class ImportViewRunner:
 
     def _load_existing_view_source(self) -> Dict[str, ViewSourceRow]:
         sql = (
-            "SELECT table_id as view_id, table_name as view_name, '' as db_name, ddl_sql, hash, has_row, parse_status "
+            "SELECT table_id as view_id, table_name as view_name, hash, has_row, parse_status "
             "FROM dw_meta.table_source "
             f"WHERE LOWER(source_system) = LOWER('{self.sourcedb}') AND table_type = 'VIEW'"
         )
@@ -775,7 +775,7 @@ class ImportViewRunner:
 
     def _load_existing_table_source(self, table_type: str = "VIEW") -> Dict[str, ViewSourceRow]:
         sql = (
-            "SELECT table_id as view_id, table_name as view_name, '' as db_name, ddl_sql, hash, has_row, parse_status "
+            "SELECT table_id as view_id, table_name as view_name, hash, has_row, parse_status "
             "FROM dw_meta.table_source "
             f"WHERE LOWER(source_system) = LOWER('{self.sourcedb}') AND table_type = '{table_type}'"
         )
@@ -791,7 +791,7 @@ class ImportViewRunner:
 
     def _find_existing_in_db(self, view_name: str, table_type: str, source_system: str) -> Optional[ViewSourceRow]:
         sql = (
-            "SELECT table_id as view_id, table_name as view_name, '' as db_name, ddl_sql, hash, has_row, parse_status "
+            "SELECT table_id as view_id, table_name as view_name, hash, has_row, parse_status "
             "FROM dw_meta.table_source "
             f"WHERE LOWER(source_system) = LOWER('{source_system}') AND table_type = '{table_type}' "
             f"AND LOWER(table_name) = LOWER('{view_name}') "
@@ -832,19 +832,20 @@ class ImportViewRunner:
                 return None
         return None
 
-    def _build_view_source_row(self, row: Any, warn_context: str = "") -> Optional[ViewSourceRow]:
+    def _build_view_source_row(self, row: Any, warn_context: str = "", idx_map: Optional[Dict[str, int]] = None) -> Optional[ViewSourceRow]:
         """
         将元库查询结果行解析为 ViewSourceRow，容错字段名缺失或返回 tuple/list。
         """
-        view_id_raw = self._get_row_value(row, ["view_id", "table_id"], idx=0)
-        view_name_raw = self._get_row_value(row, ["view_name", "table_name"], idx=1)
-        ddl_sql_raw = self._get_row_value(row, ["ddl_sql"], idx=3) or ""
-        hash_raw = self._get_row_value(row, ["hash"], idx=4) or ""
-        has_row_raw = self._get_row_value(row, ["has_row"], idx=5)
-        parse_status_raw = self._get_row_value(row, ["parse_status"], idx=6)
+        idx_map = idx_map or {"view_id": 0, "view_name": 1, "ddl_sql": None, "hash": 2, "has_row": 3, "parse_status": 4}
+        view_id_raw = self._get_row_value(row, ["view_id", "table_id"], idx=idx_map.get("view_id"))
+        view_name_raw = self._get_row_value(row, ["view_name", "table_name"], idx=idx_map.get("view_name"))
+        ddl_sql_raw = self._get_row_value(row, ["ddl_sql"], idx=idx_map.get("ddl_sql")) or ""
+        hash_raw = self._get_row_value(row, ["hash"], idx=idx_map.get("hash")) or ""
+        has_row_raw = self._get_row_value(row, ["has_row"], idx=idx_map.get("has_row"))
+        parse_status_raw = self._get_row_value(row, ["parse_status"], idx=idx_map.get("parse_status"))
 
         if not view_name_raw:
-            logger.warning(f"table_source 行缺少 view_name，跳过 (context={warn_context}): {row}")
+            logger.warning(f"table_source {row} 行缺少 view_name，跳过 (context={warn_context}): {row}")
             return None
         try:
             has_row_val = int(has_row_raw) if has_row_raw is not None else None
