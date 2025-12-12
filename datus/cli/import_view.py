@@ -749,20 +749,10 @@ class ImportViewRunner:
         rows = self._rows_from_result(result)
         existing: Dict[str, ViewSourceRow] = {}
         for row in rows:
-            key = str(row.get("view_name", "")).lower()
-            try:
-                has_row_val = int(row.get("has_row")) if row.get("has_row") is not None else None
-            except Exception:
-                has_row_val = row.get("has_row")
-            existing[key] = ViewSourceRow(
-                view_id=row.get("view_id"),
-                view_name=row.get("view_name", ""),
-                db_name="",
-                ddl_sql=row.get("ddl_sql", ""),
-                sql_hash=row.get("hash", "") or "",
-                has_row=has_row_val,
-                parse_status=row.get("parse_status"),
-            )
+            parsed = self._build_view_source_row(row, warn_context="load_existing_view_source")
+            if not parsed:
+                continue
+            existing[parsed.view_name.lower()] = parsed
         return existing
 
     def _load_table_source_map(self) -> Dict[str, Dict[str, Any]]:
@@ -793,20 +783,10 @@ class ImportViewRunner:
         rows = self._rows_from_result(result)
         existing: Dict[str, ViewSourceRow] = {}
         for row in rows:
-            key = str(row.get("view_name", "")).lower()
-            try:
-                has_row_val = int(row.get("has_row")) if row.get("has_row") is not None else None
-            except Exception:
-                has_row_val = row.get("has_row")
-            existing[key] = ViewSourceRow(
-                view_id=row.get("view_id"),
-                view_name=row.get("view_name", ""),
-                db_name="",
-                ddl_sql=row.get("ddl_sql", ""),
-                sql_hash=row.get("hash", "") or "",
-                has_row=has_row_val,
-                parse_status=row.get("parse_status"),
-            )
+            parsed = self._build_view_source_row(row, warn_context="load_existing_table_source")
+            if not parsed:
+                continue
+            existing[parsed.view_name.lower()] = parsed
         return existing
 
     def _find_existing_in_db(self, view_name: str, table_type: str, source_system: str) -> Optional[ViewSourceRow]:
@@ -821,21 +801,58 @@ class ImportViewRunner:
         rows = self._rows_from_result(res)
         if not rows:
             return None
-        row = rows[0]
-        try:
-            has_row_val = int(row.get("has_row")) if row.get("has_row") is not None else None
-        except Exception:
-            has_row_val = row.get("has_row")
-        return ViewSourceRow(
-            view_id=row.get("view_id"),
-            view_name=row.get("view_name", ""),
-            db_name="",
-            ddl_sql=row.get("ddl_sql", ""),
-            sql_hash=row.get("hash", "") or "",
-            has_row=has_row_val,
-            parse_status=row.get("parse_status"),
-        )
+        parsed = self._build_view_source_row(rows[0], warn_context="find_existing_in_db")
+        return parsed
 
+    def _get_row_value(self, row: Any, keys: List[str], idx: Optional[int]) -> Any:
+        """
+        读取查询结果行的值，优先字段名，其次 col{idx}，最后按位置索引，兼容 tuple/list。
+        """
+        if not isinstance(keys, (list, tuple)):
+            keys = [keys]
+        if isinstance(row, dict):
+            for k in keys:
+                if k in row and row.get(k) is not None:
+                    return row.get(k)
+            if idx is not None:
+                col_key = f"col{idx}"
+                if col_key in row:
+                    return row.get(col_key)
+        if idx is not None:
+            try:
+                return row[idx]
+            except Exception:
+                return None
+        return None
+
+    def _build_view_source_row(self, row: Any, warn_context: str = "") -> Optional[ViewSourceRow]:
+        """
+        将元库查询结果行解析为 ViewSourceRow，容错字段名缺失或返回 tuple/list。
+        """
+        view_id_raw = self._get_row_value(row, ["view_id", "table_id"], idx=0)
+        view_name_raw = self._get_row_value(row, ["view_name", "table_name"], idx=1)
+        ddl_sql_raw = self._get_row_value(row, ["ddl_sql"], idx=3) or ""
+        hash_raw = self._get_row_value(row, ["hash"], idx=4) or ""
+        has_row_raw = self._get_row_value(row, ["has_row"], idx=5)
+        parse_status_raw = self._get_row_value(row, ["parse_status"], idx=6)
+
+        if not view_name_raw:
+            logger.warning(f"table_source 行缺少 view_name，跳过 (context={warn_context}): {row}")
+            return None
+        try:
+            has_row_val = int(has_row_raw) if has_row_raw is not None else None
+        except Exception:
+            has_row_val = has_row_raw
+
+        return ViewSourceRow(
+            view_id=view_id_raw,
+            view_name=view_name_raw,
+            db_name="",
+            ddl_sql=ddl_sql_raw,
+            sql_hash=hash_raw,
+            has_row=has_row_val,
+            parse_status=parse_status_raw,
+        )
     def _upsert_table_source(
         self, row: ViewSourceRow, existing: Optional[ViewSourceRow], table_type: str = "VIEW"
     ) -> Tuple[int, bool]:
