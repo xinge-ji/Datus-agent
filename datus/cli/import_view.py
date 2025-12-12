@@ -713,9 +713,9 @@ class ImportViewRunner:
         except Exception as exc:
             if "ORA" in str(exc).upper():
                 logger.warning(
-                    f"检测 {full_table_name} 遇到 ORA-ERROR，跳过探测，默认 has_row=1 parse_status=NEW，SQL=[{sql}]"
+                    f"检测 {full_table_name} 遇到 ORA-ERROR，跳过探测，默认 has_row=0 parse_status=SKIPPED，SQL=[{sql}]"
                 )
-                return 1, "NEW"
+                return 0, "SKIPPED"
             raise RuntimeError(f"检测 {full_table_name} 是否有数据失败, SQL=[{sql}]: {exc}") from exc
 
         if not res or not getattr(res, "success", False):
@@ -723,18 +723,18 @@ class ImportViewRunner:
             err_upper = str(err).upper()
             if "ORA" in err_upper:
                 logger.warning(
-                    f"检测 {full_table_name} 遇到 ORA-ERROR，跳过探测，默认 has_row=1 parse_status=NEW，SQL=[{sql}]"
+                    f"检测 {full_table_name} 遇到 ORA-ERROR，跳过探测，默认 has_row=0 parse_status=SKIPPED，SQL=[{sql}]"
                 )
-                return 1, "NEW"
+                return 0, "SKIPPED"
             raise RuntimeError(f"检测 {full_table_name} 是否有数据失败, SQL=[{sql}]: {err}")
         err_detail = getattr(res, "error", None)
         if err_detail:
             err_upper = str(err_detail).upper()
             if "ORA" in err_upper:
                 logger.warning(
-                    f"检测 {full_table_name} 遇到 ORA-ERROR，跳过探测，默认 has_row=1 parse_status=NEW，SQL=[{sql}]"
+                    f"检测 {full_table_name} 遇到 ORA-ERROR，跳过探测，默认 has_row=0 parse_status=SKIPPED，SQL=[{sql}]"
                 )
-                return 1, "NEW"
+                return 0, "SKIPPED"
             raise RuntimeError(f"检测 {full_table_name} 是否有数据失败, SQL=[{sql}]: {err_detail}")
         rows = self._rows_from_result(res)
         return (1 if rows else 0), None
