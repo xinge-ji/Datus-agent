@@ -112,12 +112,16 @@ class ImportViewRunner:
 
         for tbl in all_tables:
             row = self._normalize_view(tbl)
-            has_row, status_override = self._check_has_data(tbl)
+            key = row.view_name.lower()
+            existing = table_existing.get(key)
+            # incremental 模式复用已有 has_row，避免重复探测
+            has_row = existing.has_row if self.strategy == "incremental" and existing else None
+            status_override = None
+            if has_row is None:
+                has_row, status_override = self._check_has_data(tbl)
             row.has_row = has_row
             if status_override:
                 row.parse_status = status_override
-            key = row.view_name.lower()
-            existing = table_existing.get(key)
             table_id, changed = self._upsert_table_source(row, existing, table_type="TABLE")
             row.view_id = table_id
             table_existing[key] = row
@@ -131,11 +135,18 @@ class ImportViewRunner:
 
         for view_meta in all_views:
             row = self._normalize_view(view_meta)
-            has_row, status_override = self._check_has_data(view_meta)
-            row.has_row = has_row
-            row.parse_status = status_override or ("SKIPPED" if not row.has_row else None)
             key = row.view_name.lower()
             existing = view_existing.get(key)
+            # incremental 模式复用已有 has_row，避免重复探测
+            has_row = existing.has_row if self.strategy == "incremental" and existing else None
+            status_override = None
+            if has_row is None:
+                has_row, status_override = self._check_has_data(view_meta)
+            row.has_row = has_row
+            if status_override:
+                row.parse_status = status_override
+            elif not (self.strategy == "incremental" and existing):
+                row.parse_status = "SKIPPED" if not row.has_row else None
             view_id, changed = self._upsert_table_source(row, existing, table_type="VIEW")
             row.view_id = view_id
             view_existing[key] = row
