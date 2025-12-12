@@ -700,9 +700,9 @@ class ImportViewRunner:
         try:
             res = self.source_conn.execute({"sql_query": sql, "result_format": "list"})
         except Exception as exc:
-            if "ORA-16000" in str(exc).upper():
+            if "ORA" in str(exc).upper():
                 logger.warning(
-                    f"检测 {full_table_name} 遇到 ORA-16000（只读库），跳过探测，默认 has_row=1 parse_status=NEW，SQL=[{sql}]"
+                    f"检测 {full_table_name} 遇到 ORA-ERROR，跳过探测，默认 has_row=1 parse_status=NEW，SQL=[{sql}]"
                 )
                 return 1, "NEW"
             raise RuntimeError(f"检测 {full_table_name} 是否有数据失败, SQL=[{sql}]: {exc}") from exc
@@ -710,18 +710,18 @@ class ImportViewRunner:
         if not res or not getattr(res, "success", False):
             err = getattr(res, "error", "未知错误")
             err_upper = str(err).upper()
-            if "ORA-16000" in err_upper:
+            if "ORA" in err_upper:
                 logger.warning(
-                    f"检测 {full_table_name} 遇到 ORA-16000（只读库），跳过探测，默认 has_row=1 parse_status=NEW，SQL=[{sql}]"
+                    f"检测 {full_table_name} 遇到 ORA-ERROR，跳过探测，默认 has_row=1 parse_status=NEW，SQL=[{sql}]"
                 )
                 return 1, "NEW"
             raise RuntimeError(f"检测 {full_table_name} 是否有数据失败, SQL=[{sql}]: {err}")
         err_detail = getattr(res, "error", None)
         if err_detail:
             err_upper = str(err_detail).upper()
-            if "ORA-16000" in err_upper:
+            if "ORA" in err_upper:
                 logger.warning(
-                    f"检测 {full_table_name} 遇到 ORA-16000（只读库），跳过探测，默认 has_row=1 parse_status=NEW，SQL=[{sql}]"
+                    f"检测 {full_table_name} 遇到 ORA-ERROR，跳过探测，默认 has_row=1 parse_status=NEW，SQL=[{sql}]"
                 )
                 return 1, "NEW"
             raise RuntimeError(f"检测 {full_table_name} 是否有数据失败, SQL=[{sql}]: {err_detail}")
@@ -843,7 +843,10 @@ class ImportViewRunner:
             source_system_raw = self.sourcedb
         source_system_norm = self._escape(source_system_raw).lower()
 
+        name_key = view_name.strip('"')
         existing_row = existing or self._find_existing_in_db(view_name, table_type, source_system_norm)
+        if not existing_row and name_key and name_key != view_name:
+            existing_row = self._find_existing_in_db(name_key, table_type, source_system_norm)
         existing_status = (existing_row.parse_status or "").upper() if existing_row else ""
         target_status = requested_status or existing_status or "NEW"
         if not requested_status and existing_status == "SKIPPED" and has_row:
@@ -871,6 +874,13 @@ class ImportViewRunner:
             return existing_row.view_id, True
 
         # 新增
+        # 插入前再做一次兜底查询，避免因大小写/引号差异导致重复
+        if not existing_row:
+            precheck = self._find_existing_in_db(view_name, table_type, source_system_norm)
+            if not precheck and name_key and name_key != view_name:
+                precheck = self._find_existing_in_db(name_key, table_type, source_system_norm)
+            if precheck:
+                return precheck.view_id or 0, False
         insert = (
             "INSERT INTO dw_meta.table_source "
             "(source_system, table_name, table_type, ddl_sql, hash, has_row, parse_status, created_at, updated_at) "
