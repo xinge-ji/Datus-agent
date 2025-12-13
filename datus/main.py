@@ -353,6 +353,105 @@ def create_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
+    # propose-model command
+    propose_model_parser = subparsers.add_parser(
+        "propose-model",
+        help="对 AST 成功的视图生成 DIM/DWD 模型草稿（或记录 DWS 设计）",
+        parents=[global_parser],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    propose_model_parser.add_argument("--namespace", type=str, required=True, help="Database namespace")
+    propose_model_parser.add_argument("--database", type=str, default="", help="Logical database for dw_meta")
+    propose_model_parser.add_argument("--node_ids", type=str, help="node_id 列表，逗号或空格分隔")
+    propose_model_parser.add_argument(
+        "--layer", type=str, choices=["DIM", "DWD", "DWS"], help="仅处理指定层的视图（默认全选）"
+    )
+    propose_model_parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="启用硬规则（覆盖率/复杂度不达标直接跳过）",
+    )
+    propose_model_parser.add_argument("--llm_model", type=str, default="", help="指定 LLM 模型")
+    propose_model_parser.add_argument(
+        "--include-dws",
+        action="store_true",
+        help="同时记录 DWS 设计（不落地模型）",
+    )
+
+    # gen-sqlmesh command
+    gen_sqlmesh_parser = subparsers.add_parser(
+        "gen-sqlmesh",
+        help="从 dw_model 元数据生成 sqlmesh 模型文件",
+        parents=[global_parser],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    gen_sqlmesh_parser.add_argument("--namespace", type=str, required=True, help="Database namespace")
+    gen_sqlmesh_parser.add_argument("--database", type=str, default="", help="Logical database for dw_meta")
+    gen_sqlmesh_parser.add_argument("--model_ids", type=str, help="逗号或空格分隔的 model_id 列表")
+    gen_sqlmesh_parser.add_argument("--model_names", type=str, help="逗号或空格分隔的模型名列表")
+    gen_sqlmesh_parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="models",
+        help="输出目录（默认 models/）",
+    )
+    gen_sqlmesh_parser.add_argument(
+        "--include-draft",
+        action="store_true",
+        help="包含 DRAFT 状态的模型一起生成",
+    )
+    gen_sqlmesh_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="仅打印将要生成的模型，不落盘",
+    )
+
+    # import-sqlmesh command
+    import_sqlmesh_parser = subparsers.add_parser(
+        "import-sqlmesh",
+        help="解析 sqlmesh 模型文件并同步到元数据",
+        parents=[global_parser],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    import_sqlmesh_parser.add_argument("--namespace", type=str, required=True, help="Database namespace")
+    import_sqlmesh_parser.add_argument("--database", type=str, default="", help="Logical database for dw_meta")
+    import_sqlmesh_parser.add_argument("--path", type=str, required=True, help="sqlmesh 模型文件或目录")
+    import_sqlmesh_parser.add_argument("--layer", type=str, choices=["DIM", "DWD", "DWS"], help="模型层级（可选）")
+    import_sqlmesh_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="默认 dry-run，带此参数才会写入元数据",
+    )
+    import_sqlmesh_parser.add_argument("--llm_model", type=str, default="", help="指定 LLM 模型用于 std_field 匹配提示")
+
+    # compare-view command
+    compare_view_parser = subparsers.add_parser(
+        "compare-view",
+        help="重建标准视图并与源视图抽样对比，写入 view_compare_result",
+        parents=[global_parser],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    compare_view_parser.add_argument("--namespace", type=str, required=True, help="Database namespace")
+    compare_view_parser.add_argument("--database", type=str, default="", help="Logical database for dw_meta")
+    compare_view_parser.add_argument("--view", type=str, required=True, help="源视图 node_id 或名称")
+    compare_view_parser.add_argument("--sample", type=int, default=1000, help="抽样条数，默认 1000")
+    compare_view_parser.add_argument("--metrics", type=str, help="逗号分隔的对比字段/指标")
+
+    # lint-sqlmesh command
+    lint_sqlmesh_parser = subparsers.add_parser(
+        "lint-sqlmesh",
+        help="检查 sqlmesh 模型命名/字段标准化并输出建议",
+        parents=[global_parser],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    lint_sqlmesh_parser.add_argument("--path", type=str, required=True, help="sqlmesh 模型文件或目录")
+    lint_sqlmesh_parser.add_argument("--llm_model", type=str, default="", help="指定 LLM 模型")
+    lint_sqlmesh_parser.add_argument(
+        "--apply-rename",
+        action="store_true",
+        help="生成兼容视图/rename 提示（仅建议，不改表）",
+    )
+
     # Node configuration group (available for run and benchmark)
     for p in [run_parser, benchmark_parser]:
         node_group = p.add_argument_group("Node Configuration")
@@ -475,6 +574,16 @@ def main():
         result = agent.generate_dataset()
     elif args.action in ("eval", "evaluation", "evaluate"):
         result = agent.evaluation()
+    elif args.action == "propose-model":
+        result = agent.propose_model()
+    elif args.action == "gen-sqlmesh":
+        result = agent.gen_sqlmesh()
+    elif args.action == "import-sqlmesh":
+        result = agent.import_sqlmesh()
+    elif args.action == "compare-view":
+        result = agent.compare_view()
+    elif args.action == "lint-sqlmesh":
+        result = agent.lint_sqlmesh()
     if result:
         logger.info(f"\nFinal Result: {result}")
 

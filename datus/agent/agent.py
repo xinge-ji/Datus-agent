@@ -242,6 +242,36 @@ class Agent:
 
         return run_import_view(self.global_config, self.db_manager, self.args)
 
+    def propose_model(self):
+        """对 AST 成功的视图生成 DIM/DWD 模型草稿或记录 DWS 设计。"""
+        from datus.cli.propose_model import run_propose_model
+
+        return run_propose_model(self.global_config, self.db_manager, self.args)
+
+    def gen_sqlmesh(self):
+        """从元数据生成 sqlmesh 模型文件。"""
+        from datus.cli.gen_sqlmesh import run_gen_sqlmesh
+
+        return run_gen_sqlmesh(self.global_config, self.db_manager, self.args)
+
+    def import_sqlmesh(self):
+        """解析 sqlmesh 模型并同步元数据。"""
+        from datus.cli.import_sqlmesh import run_import_sqlmesh
+
+        return run_import_sqlmesh(self.global_config, self.db_manager, self.args)
+
+    def compare_view(self):
+        """重建标准视图并做抽样对比。"""
+        from datus.cli.compare_view import run_compare_view
+
+        return run_compare_view(self.global_config, self.db_manager, self.args)
+
+    def lint_sqlmesh(self):
+        """检查 sqlmesh 模型的命名和标准字段匹配。"""
+        from datus.cli.lint_sqlmesh import run_lint_sqlmesh
+
+        return run_lint_sqlmesh(self.global_config, self.db_manager, self.args)
+
     def bootstrap_kb(self):
         """Initialize knowledge base storage components."""
         logger.info("Initializing knowledge base components")

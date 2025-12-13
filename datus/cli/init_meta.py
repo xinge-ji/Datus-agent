@@ -184,15 +184,17 @@ updated_at            DATETIME,
 PRIMARY KEY (mapping_id)
 """,
     ),
-    TableDefinition(
-        name="dw_model",
-        columns="""
+TableDefinition(
+    name="dw_model",
+    columns="""
 model_id             BIGINT NOT NULL AUTO_INCREMENT,
 model_name           VARCHAR(128) NOT NULL COMMENT '如 dwd_sales_detail',
 db_name              VARCHAR(128) NOT NULL COMMENT '如 dwd_erp',
 table_name           VARCHAR(128) NOT NULL COMMENT '物理表名，通常=模型名',
 layer                VARCHAR(16)  NOT NULL COMMENT 'DIM/DWD/DWS',
 sqlmesh_model_name   VARCHAR(256) NULL COMMENT 'sqlmesh 模型名，如 dwd_erp.dwd_sales_detail',
+origin               VARCHAR(16)  NULL COMMENT 'AUTO/ MANUAL',
+sync_direction       VARCHAR(16)  NULL COMMENT 'META_TO_CODE / CODE_TO_META',
 biz_domain_code      VARCHAR(64)  NULL,
 biz_entity_code      VARCHAR(64)  NULL,
 grain_desc           STRING NULL COMMENT '粒度描述',
@@ -201,6 +203,7 @@ partition_key        VARCHAR(128) NULL,
 distributed_key      VARCHAR(128) NULL,
 incremental_strategy VARCHAR(64)  NULL,
 default_filter       STRING NULL COMMENT '如 is_active = 1',
+source_node_id       BIGINT NULL COMMENT '上游 dw_node.node_id',
 source_table_id      BIGINT NULL COMMENT '原始表或视图ID',
 status               VARCHAR(16) DEFAULT 'DRAFT' COMMENT 'DRAFT/ACTIVE/DEPRECATED',
 created_at           DATETIME,
@@ -227,15 +230,31 @@ updated_at         DATETIME,
 PRIMARY KEY (model_id, column_name)
 """,
     ),
-    TableDefinition(
-        name="ai_view_feature",
-        columns="""
+TableDefinition(
+    name="ai_view_feature",
+    columns="""
 table_id     BIGINT NOT NULL,
 feature_json STRING NOT NULL COMMENT 'sqlglot 抽取的特征 JSON',
 analyzed_at  DATETIME,
 PRIMARY KEY (table_id)
 """,
-    ),
+),
+TableDefinition(
+    name="view_compare_result",
+    columns="""
+compare_id      BIGINT NOT NULL AUTO_INCREMENT,
+source_view_id  BIGINT NOT NULL COMMENT 'dw_node.node_id of SRC_VIEW',
+target_model_id BIGINT NULL COMMENT 'dw_model.model_id used to rebuild',
+sample_size     INT NULL,
+row_count_diff  BIGINT NULL COMMENT 'target_count - source_count',
+metric_diff     STRING NULL COMMENT 'JSON: {col: {diff_rate, examples}}',
+status          VARCHAR(16) DEFAULT 'PENDING' COMMENT 'PENDING/PASS/FAIL',
+message         STRING NULL,
+created_at      DATETIME,
+updated_at      DATETIME,
+PRIMARY KEY (compare_id)
+""",
+),
     TableDefinition(
         name="ai_feedback",
         columns="""
