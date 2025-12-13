@@ -576,38 +576,3 @@ def to_str(json_data: Any) -> Optional[str]:
     if json_data is None:
         return None
     return _dump_json(json_data)
-
-
-def safe_extract_json(text: str) -> Dict[str, Any]:
-    """
-    安全地从文本中提取JSON字典。
-
-    从 import_view.py._extract_json_dict 迁移而来。
-
-    Args:
-        text: 包含JSON的文本
-
-    Returns:
-        提取的JSON字典，如果提取失败则返回空字典
-
-    Examples:
-        >>> safe_extract_json('Here is some data: {"key": "value"}')
-        {'key': 'value'}
-        >>> safe_extract_json('No JSON here')
-        {}
-        >>> safe_extract_json('Malformed JSON: {"key": "value"')
-        {}
-    """
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-
-    if "{" in text and "}" in text:
-        try:
-            raw = text[text.index("{") : text.rindex("}") + 1]
-            return json.loads(raw)
-        except Exception:
-            pass
-
-    return {}
