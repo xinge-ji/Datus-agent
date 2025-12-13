@@ -111,14 +111,14 @@ DW_META_TABLES: tuple[TableDefinition, ...] = (
 table_id       BIGINT NOT NULL AUTO_INCREMENT,
 source_system  VARCHAR(64) NOT NULL COMMENT 'ERP/CRM/..',
 table_name     VARCHAR(256) NOT NULL COMMENT '源表或视图名称',
+hash           VARCHAR(64)  NULL COMMENT 'SQL hash，避免重复处理',
 table_type     VARCHAR(32) NOT NULL COMMENT 'TABLE/VIEW/MATERIALIZED_VIEW',
 ddl_sql        STRING       NOT NULL COMMENT '表或视图定义SQL',
-hash           VARCHAR(64)  NULL COMMENT 'SQL hash，避免重复处理',
 has_row        INT NOT NULL COMMENT '是否有数据',
 parse_status   VARCHAR(32) DEFAULT 'NEW' COMMENT 'NEW/PARSED/FAILED/SKIPPED',
 created_at     DATETIME,
 updated_at     DATETIME,
-PRIMARY KEY (table_id)
+PRIMARY KEY (table_id, source_system, table_name, hash)
 """,
     ),
     TableDefinition(
@@ -184,9 +184,9 @@ updated_at            DATETIME,
 PRIMARY KEY (mapping_id)
 """,
     ),
-TableDefinition(
-    name="dw_model",
-    columns="""
+    TableDefinition(
+        name="dw_model",
+        columns="""
 model_id             BIGINT NOT NULL AUTO_INCREMENT,
 model_name           VARCHAR(128) NOT NULL COMMENT '如 dwd_sales_detail',
 db_name              VARCHAR(128) NOT NULL COMMENT '如 dwd_erp',
@@ -230,18 +230,18 @@ updated_at         DATETIME,
 PRIMARY KEY (model_id, column_name)
 """,
     ),
-TableDefinition(
-    name="ai_view_feature",
-    columns="""
+    TableDefinition(
+        name="ai_view_feature",
+        columns="""
 table_id     BIGINT NOT NULL,
 feature_json STRING NOT NULL COMMENT 'sqlglot 抽取的特征 JSON',
 analyzed_at  DATETIME,
 PRIMARY KEY (table_id)
 """,
-),
-TableDefinition(
-    name="view_compare_result",
-    columns="""
+    ),
+    TableDefinition(
+        name="view_compare_result",
+        columns="""
 compare_id      BIGINT NOT NULL AUTO_INCREMENT,
 source_view_id  BIGINT NOT NULL COMMENT 'dw_node.node_id of SRC_VIEW',
 target_model_id BIGINT NULL COMMENT 'dw_model.model_id used to rebuild',
@@ -254,7 +254,7 @@ created_at      DATETIME,
 updated_at      DATETIME,
 PRIMARY KEY (compare_id)
 """,
-),
+    ),
     TableDefinition(
         name="ai_feedback",
         columns="""

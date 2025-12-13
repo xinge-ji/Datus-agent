@@ -127,9 +127,9 @@ def create_parser() -> argparse.ArgumentParser:
     import_view_parser.add_argument(
         "--step",
         type=str,
-        choices=["all", "import", "analyze", "classify", "naming"],
+        choices=["all", "import", "import_tables", "import_views", "classify", "naming"],
         default="all",
-        help="执行步骤：import(仅导入DDL), analyze(仅AST分析), classify(AI分层确认), naming(标准化字段命名), all(全流程)",
+        help="执行步骤：import(导入DDL与AST), classify(AI分层确认), naming(标准化字段命名), all(全流程)",
     )
 
     # bootstrap-kb command

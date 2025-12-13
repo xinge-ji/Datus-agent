@@ -86,11 +86,11 @@ class ImportViewRunner:
 
         if self.step in {"all", "import"}:
             stats["details"]["import_tables"] = self.run_import_tables()
-            stats["details"]["import_views"] = self.run_import_views_with_ast()
+            stats["details"]["import_views"] = self.run_import_views_two_phase()
         elif self.step == "import_tables":
             stats["details"]["import_tables"] = self.run_import_tables()
         elif self.step in {"import_views", "analyze"}:
-            stats["details"]["import_views"] = self.run_import_views_with_ast()
+            stats["details"]["import_views"] = self.run_import_views_two_phase()
 
         if self.step in {"all", "classify"}:
             stats["details"]["classify"] = self.run_layer_classification()
@@ -102,12 +102,15 @@ class ImportViewRunner:
 
     def run_import_tables(self) -> Dict[str, int]:
         """阶段1：导入表 DDL。"""
+        before_count = self._count_table_source(self.sourcedb, "TABLE")
+        watch_system = "wms" if self.sourcedb.lower() != "wms" else None
+        watch_count = self._count_table_source(watch_system, "TABLE") if watch_system else None
         all_tables = self._load_tables()
         table_existing = self._load_existing_table_source(table_type="TABLE")
 
         added = updated = skipped = 0
 
-        for tbl in all_tables:
+        for idx, tbl in enumerate(all_tables, start=1):
             row = self._normalize_view(tbl)
             key = row.view_name.lower()
             existing = table_existing.get(key)
@@ -130,21 +133,78 @@ class ImportViewRunner:
             else:
                 added += 1
 
-        logger.info(f"表 DDL 导入完成: 新增 {added}, 更新 {updated}, 跳过 {skipped}")
-        return {"added": added, "updated": updated, "skipped": skipped}
+            if idx % 100 == 0:
+                current_count = self._count_table_source(self.sourcedb, "TABLE")
+                if current_count < before_count:
+                    logger.warning(
+                        f"[COUNT_GUARD] 表计数下降，source_system={self.sourcedb}, before={before_count}, now={current_count}, processed={idx}/{len(all_tables)}"
+                    )
+                    before_count = current_count
+                if watch_system:
+                    current_watch = self._count_table_source(watch_system, "TABLE")
+                    if current_watch < (watch_count or 0):
+                        logger.warning(
+                            f"[COUNT_GUARD] 其他源计数下降，source_system={watch_system}, before={watch_count}, now={current_watch}, processed={idx}/{len(all_tables)} (current={self.sourcedb})"
+                        )
+                        watch_count = current_watch
 
-    def run_import_views_with_ast(self) -> Dict[str, int]:
+        after_count = self._count_table_source(self.sourcedb, "TABLE")
+        if after_count < before_count:
+            logger.warning(
+                f"[COUNT_GUARD] 表计数下降，source_system={self.sourcedb}, before={before_count}, after={after_count}"
+            )
+        after_watch = None
+        if watch_system:
+            after_watch = self._count_table_source(watch_system, "TABLE")
+            if after_watch < (watch_count or 0):
+                logger.warning(
+                    f"[COUNT_GUARD] 其他源计数下降，source_system={watch_system}, before={watch_count}, after={after_watch}, current={self.sourcedb}"
+                )
+
+        logger.info(f"表 DDL 导入完成: 新增 {added}, 更新 {updated}, 跳过 {skipped}")
+        return {
+            "added": added,
+            "updated": updated,
+            "skipped": skipped,
+            "count_before": before_count,
+            "count_after": after_count,
+            "watch_system": watch_system,
+            "watch_count_after": after_watch,
+        }
+
+    def run_import_views_two_phase(self) -> Dict[str, int]:
         """
-        阶段2：视图 DDL 导入 + AST 解析 + has_row 推断 + 血缘入库。
+        阶段2：视图分两步：
+        1) 仅导入 DDL，has_row=-1，parse_status=NEW（不跑 AST）
+        2) 重新加载表，跑 AST + has_row 推断 + feature/血缘写入
         """
         all_views = self._load_views()
         view_existing = self._load_existing_view_source()
+
+        # Phase 1: 仅写入 DDL，占位
+        added_stage1 = updated_stage1 = skipped_stage1 = 0
+        for view_meta in all_views:
+            row = self._normalize_view(view_meta)
+            key = row.view_name.lower()
+            existing = view_existing.get(key)
+            row.has_row = -1
+            row.parse_status = "NEW"
+            view_id, changed = self._upsert_table_source(row, existing, table_type="VIEW")
+            row.view_id = view_id
+            view_existing[key] = row
+            if existing:
+                if changed:
+                    updated_stage1 += 1
+                else:
+                    skipped_stage1 += 1
+            else:
+                added_stage1 += 1
+
+        # Phase 2: AST + has_row + feature
+        view_existing = self._load_existing_view_source()
         feature_cache = self._load_feature_cache([v.view_id for v in view_existing.values() if v.view_id])
-
-        if self.strategy == "overwrite":
-            self._cleanup_downstream(list(view_existing.keys()))
-
         table_source_map = self._load_table_source_map(include_has_row=True)
+
         added = updated = upsert_skipped = analyzed = failed = 0
         parse_skipped = 0
 
@@ -152,7 +212,7 @@ class ImportViewRunner:
             row = self._normalize_view(view_meta)
             key = row.view_name.lower()
             existing = view_existing.get(key)
-            has_row = existing.has_row if self.strategy == "incremental" and existing else None
+            has_row = None if existing and existing.has_row == -1 else existing.has_row if existing else None
             feature_ctx: Optional[Dict[str, Any]] = None
             cached_feature = None
             if existing and existing.view_id and existing.view_id in feature_cache:
@@ -165,8 +225,7 @@ class ImportViewRunner:
             else:
                 feature_ctx = cached_feature
             row.has_row = has_row
-            if not (self.strategy == "incremental" and existing):
-                row.parse_status = "SKIPPED" if not row.has_row else None
+            row.parse_status = "SKIPPED" if row.has_row == 0 else "NEW"
             view_id, changed = self._upsert_table_source(row, existing, table_type="VIEW")
             row.view_id = view_id
             view_existing[key] = row
@@ -193,7 +252,8 @@ class ImportViewRunner:
             if (
                 self.strategy == "incremental"
                 and existing
-                and (existing.parse_status or "").upper() == "PARSED"
+                and existing.has_row != -1
+                and (existing.parse_status or "").upper() in {"PARSED", "SKIPPED"}
                 and prev_hash
                 and prev_hash == row.sql_hash
             ):
@@ -220,9 +280,13 @@ class ImportViewRunner:
                 failed += 1
 
         logger.info(
-            f"视图导入+AST 完成: 新增 {added}, 更新 {updated}, 写入跳过 {upsert_skipped}, 解析跳过 {parse_skipped}, 解析成功 {analyzed}, 解析失败 {failed}"
+            f"视图导入两阶段完成: 阶段1新增 {added_stage1}, 更新 {updated_stage1}, 跳过 {skipped_stage1}; "
+            f"阶段2新增 {added}, 更新 {updated}, 写入跳过 {upsert_skipped}, 解析跳过 {parse_skipped}, 解析成功 {analyzed}, 解析失败 {failed}"
         )
         return {
+            "stage1_added": added_stage1,
+            "stage1_updated": updated_stage1,
+            "stage1_skipped": skipped_stage1,
             "added": added,
             "updated": updated,
             "skipped_upsert": upsert_skipped,
@@ -808,6 +872,21 @@ class ImportViewRunner:
             raise RuntimeError(f"检测 {full_table_name} 是否有数据失败, SQL=[{sql}]: {err_detail}")
         rows = self._rows_from_result(res)
         return (1 if rows else 0), None
+
+    def _count_table_source(self, source_system: str, table_type: str) -> int:
+        sql = (
+            "SELECT COUNT(1) as cnt FROM dw_meta.table_source "
+            f"WHERE LOWER(source_system) = LOWER('{self._escape(source_system)}') "
+            f"AND table_type = '{table_type}'"
+        )
+        res = self.meta_conn.execute({"sql_query": sql, "result_format": "list"})
+        rows = self._rows_from_result(res)
+        if not rows:
+            return 0
+        try:
+            return int(rows[0].get("cnt") or 0)
+        except Exception:
+            return 0
 
     def _infer_has_row_from_ast(
         self, view_row: ViewSourceRow, table_source_map: Dict[str, Dict[str, Any]], feature: Optional[Dict[str, Any]] = None
@@ -2173,7 +2252,7 @@ def run_import_view(agent_config: AgentConfig, db_manager: DBManager, args) -> D
                 strategy=args.update_strategy,
                 step="import_views",
             )
-            results["views"][name] = runner.run_import_views_with_ast()
+            results["views"][name] = runner.run_import_views_two_phase()
 
     if step in {"all", "classify"}:
         for name in names:
