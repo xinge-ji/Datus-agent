@@ -46,10 +46,10 @@ class SqlTask(BaseModel):
     )
     date_ranges: str = Field(default="", description="Parsed date ranges context from date parser for SQL generation")
 
-    # Metrics relative part
-    layer1: str = Field(default="", description="Layer1 name")
-    layer2: str = Field(default="", description="Layer2 name")
-    domain: str = Field(default="", description="domain name")
+    # Metrics relative part - subject path
+    subject_path: Optional[List[str]] = Field(
+        default=None, description="Subject hierarchy path (e.g., ['Finance', 'Revenue', 'Q1'])"
+    )
 
     def get(self, key: str, default: Any = None) -> Any:
         """Get a value by key with an optional default value."""
@@ -115,17 +115,19 @@ class TableSchema(BaseTableSchema):
 
         schema_text = " ".join(self.definition.split())
         # TODO: improve the schema compact for all databases
-        schema_text = schema_text.replace("VARCHAR(16777216)", "VARCHAR")
-        # schema_text = schema_text.replace('NUMBER(38,0)', 'NUMBER')
-        # schema_text = schema_text.replace('create or replace TABLE', 'TABLE')
-        full_name = self.table_name if dialect == DBType.SQLITE else self.identifier
-        return f"{full_name}: {schema_text}"
+        return schema_text.replace("VARCHAR(16777216)", "VARCHAR")
+
+    @classmethod
+    def table_names_to_prompt(cls, schemas: List[TableSchema]) -> str:
+        if not schemas:
+            return ""
+        return "\n".join([schema.table_name for schema in schemas])
 
     @classmethod
     def list_to_prompt(cls, schemas: List[TableSchema], dialect: str = "snowflake") -> str:
         if not schemas:
             return ""
-        return "\n".join([schema.to_prompt(dialect) for schema in schemas])
+        return "\n\n".join([schema.to_prompt(dialect) for schema in schemas])
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> TableSchema:

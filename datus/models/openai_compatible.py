@@ -11,6 +11,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
+import httpx
 import yaml
 from agents import Agent, ModelSettings, OpenAIChatCompletionsModel, Runner, SQLiteSession, Tool, set_tracing_disabled
 from agents.exceptions import MaxTurnsExceeded
@@ -694,11 +695,21 @@ class OpenAICompatibleModel(LLMBaseModel):
                                         "arguments": arguments,
                                         "args_display": args_str,
                                     }
-
+                                    start_action = ActionHistory(
+                                        action_id=call_id,
+                                        role=ActionRole.TOOL,
+                                        messages=f"Tool call: {tool_name}('{args_str}...')",
+                                        action_type=tool_name,
+                                        input={"function_name": tool_name, "arguments": arguments},
+                                        output={},
+                                        status=ActionStatus.PROCESSING,
+                                    )
+                                    action_history_manager.add_action(start_action)
                                     logger.debug(
                                         f"Stored tool call: {tool_name} "
                                         f"(call_id={call_id[:20] if call_id else 'None'}...)"
                                     )
+                                    yield start_action
 
                             # Handle tool call completion
                             elif item_type == "tool_call_output_item":
@@ -739,29 +750,25 @@ class OpenAICompatibleModel(LLMBaseModel):
 
                                     # Create complete action with both input and output
                                     # Put result_summary as the status message to replace default "Success"
-                                    complete_action = ActionHistory(
-                                        action_id=call_id,
-                                        role=ActionRole.TOOL,
-                                        messages=f"Tool call: {tool_name}('{args_display}...')",
-                                        action_type=tool_name,
-                                        input={"function_name": tool_name, "arguments": tool_info["arguments"]},
-                                        output={
-                                            "success": True,
-                                            "raw_output": output_content,  # Add raw output for action_display_app
-                                            "summary": result_summary,
-                                            "status_message": result_summary,
-                                        },
-                                        status=ActionStatus.SUCCESS,
-                                    )
-                                    complete_action.end_time = datetime.now()
-
+                                    output_data = {
+                                        "success": True,
+                                        "raw_output": output_content,  # Add raw output for action_display_app
+                                        "summary": result_summary,
+                                        "status_message": result_summary,
+                                    }
                                     logger.debug(
                                         f"Matched tool: {tool_name}({args_display[:30]}...) -> {result_summary}"
                                     )
 
-                                    # Add to action_history_manager before yielding (consistent with thinking messages)
-                                    action_history_manager.add_action(complete_action)
-                                    yield complete_action
+                                    # update action_history_manager before yielding (consistent with thinking messages)
+                                    action_history_manager.update_action_by_id(
+                                        call_id,
+                                        output=output_data,
+                                        end_time=datetime.now(),
+                                        status=ActionStatus.SUCCESS,
+                                    )
+                                    updated_action = action_history_manager.find_action_by_id(call_id)
+                                    yield updated_action
 
                                     # Remove from temp storage to avoid duplicates
                                     del temp_tool_calls[call_id]
@@ -842,9 +849,54 @@ class OpenAICompatibleModel(LLMBaseModel):
                 await async_client.close()
                 logger.debug("Closed AsyncOpenAI client")
 
-        # Execute the streaming operation directly without retry logic
-        async for action in _stream_operation():
-            yield action
+        # Execute the streaming operation with retry logic for connection errors
+        max_retries = getattr(self.model_config, "max_retry", 3)
+        retry_delay = getattr(self.model_config, "retry_interval", 2.0)
+
+        # Track already processed action IDs to prevent duplicates across retries
+        processed_action_ids = set()
+
+        for attempt in range(max_retries):
+            try:
+                async for action in _stream_operation():
+                    # Skip actions that were already yielded in previous retry attempts
+                    if action.action_id in processed_action_ids:
+                        logger.debug(f"Skipping duplicate action: {action.action_id}")
+                        continue
+
+                    # Mark this action as processed
+                    processed_action_ids.add(action.action_id)
+                    yield action
+                # If we successfully complete, break out of retry loop
+                break
+
+            except (httpx.RemoteProtocolError, APIConnectionError, APITimeoutError) as e:
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        f"Stream connection error (attempt {attempt + 1}/{max_retries}): {type(e).__name__}: {e}. "
+                        f"Retrying in {retry_delay}s..."
+                    )
+
+                    # Yield a retry notification action to inform user
+                    from datus.schemas.action_history import ActionHistory, ActionRole, ActionStatus
+
+                    retry_action = ActionHistory.create_action(
+                        role=ActionRole.ASSISTANT,
+                        action_type="retry_notification",
+                        messages=f"Connection interrupted, retrying ({attempt + 2}/{max_retries})...",
+                        input_data={"error": str(e), "attempt": attempt + 1},
+                        status=ActionStatus.PROCESSING,
+                    )
+                    action_history_manager.add_action(retry_action)
+                    processed_action_ids.add(retry_action.action_id)
+                    yield retry_action
+
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    # All retries exhausted
+                    logger.exception(f"Stream failed after {max_retries} attempts: {type(e).__name__}: {e}")
+                    raise
 
     async def _extract_and_distribute_token_usage(self, result, action_history_manager: ActionHistoryManager) -> None:
         """Extract token usage from completed streaming result and distribute to ActionHistory objects."""

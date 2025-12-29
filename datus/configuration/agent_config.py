@@ -64,9 +64,7 @@ class DbConfig:
 
 @dataclass
 class MetricMeta:
-    domain: str = field(default="DEFAULT_DOMAIN", init=True)
-    layer1: str = field(default="DEFAULT_LAYER1", init=True)
-    layer2: str = field(default="DEFAULT_LAYER2", init=True)
+    subject_path: str = field(default="DEFAULT_DOMAIN/DEFAULT_LAYER1/DEFAULT_LAYER2", init=True)
     ext_knowledge: str = field(default="DEFAULT_EXT_KNOWLEDGE", init=True)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -87,6 +85,9 @@ class ModelConfig:
     save_llm_trace: bool = False
     enable_thinking: bool = False
     default_headers: Optional[Dict[str, str]] = None
+    # Retry configuration for stream connection errors
+    max_retry: int = 3
+    retry_interval: float = 2.0  # seconds
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -228,6 +229,7 @@ class AgentConfig:
         self._current_namespace = ""
         self._current_database = ""
         self.nodes = nodes
+        self.export_config: Dict[str, Any] = kwargs.get("export", {})
         self.agentic_nodes = kwargs.get("agentic_nodes", {})
 
         for name, raw_config in self.agentic_nodes.items():
@@ -302,6 +304,10 @@ class AgentConfig:
     @property
     def current_namespace(self) -> str:
         return self._current_namespace
+
+    @property
+    def max_export_lines(self) -> int:
+        return self.export_config.get("max_lines", 1000)
 
     @current_namespace.setter
     def current_namespace(self, value: str):
@@ -440,9 +446,39 @@ class AgentConfig:
     def output_dir(self) -> str:
         return f"{self._save_dir}/{self._current_namespace}"
 
+    def get_save_run_dir(self, run_id: Optional[str] = None) -> str:
+        """
+        Get save directory for current namespace and optional run_id.
+
+        Args:
+            run_id: Optional run identifier (typically a timestamp)
+
+        Returns:
+            Path string for save storage
+        """
+        from datus.utils.path_manager import get_path_manager
+
+        path_manager = get_path_manager()
+        return str(path_manager.save_run_dir(self._current_namespace, run_id))
+
     @property
     def trajectory_dir(self) -> str:
         return self._trajectory_dir
+
+    def get_trajectory_run_dir(self, run_id: Optional[str] = None) -> str:
+        """
+        Get trajectory directory for current namespace and optional run_id.
+
+        Args:
+            run_id: Optional run identifier (typically a timestamp)
+
+        Returns:
+            Path string for trajectory storage
+        """
+        from datus.utils.path_manager import get_path_manager
+
+        path_manager = get_path_manager()
+        return str(path_manager.trajectory_run_dir(self._current_namespace, run_id))
 
     def reflection_nodes(self, strategy: str) -> List[str]:
         if strategy not in self._reflection_nodes:
@@ -570,12 +606,8 @@ class AgentConfig:
                 model_config.save_llm_trace = True
         if kwargs.get("metric_meta", ""):
             current_metric_meta = self.current_metric_meta(metric_meta_name=kwargs["metric_meta"])
-            if kwargs.get("domain", ""):
-                current_metric_meta.domain = kwargs["domain"]
-            if kwargs.get("layer1", ""):
-                current_metric_meta.layer1 = kwargs["layer1"]
-            if kwargs.get("layer2", ""):
-                current_metric_meta.layer2 = kwargs["layer2"]
+            if kwargs.get("subject_path", ""):
+                current_metric_meta.subject_path = kwargs["subject_path"]
             if kwargs.get("ext_knowledge", ""):
                 current_metric_meta.ext_knowledge = kwargs["ext_knowledge"]
 
@@ -698,6 +730,9 @@ def resolve_env(value: str) -> str:
 
 
 def load_model_config(data: dict) -> ModelConfig:
+    max_retry = data.get("max_retry")
+    retry_interval = data.get("retry_interval")
+
     return ModelConfig(
         type=data["type"],
         base_url=resolve_env(data["base_url"]),
@@ -706,6 +741,8 @@ def load_model_config(data: dict) -> ModelConfig:
         save_llm_trace=data.get("save_llm_trace", False),
         enable_thinking=data.get("enable_thinking", False),
         default_headers=data.get("default_headers"),
+        max_retry=int(max_retry) if max_retry is not None else 3,
+        retry_interval=float(retry_interval) if retry_interval is not None else 2.0,
     )
 
 

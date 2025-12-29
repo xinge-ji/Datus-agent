@@ -1,3 +1,7 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
 import argparse
 import json
 import os
@@ -49,6 +53,12 @@ def parse_args() -> argparse.Namespace:
         help="Explicit task ids to benchmark and evaluate (space/comma separated)",
     )
     parser.add_argument("--max_workers", type=int, default=1, help="Concurrent workers for benchmark execution.")
+    parser.add_argument(
+        "--summary_report_file",
+        type=str,
+        default=None,
+        help="Path to summary report file. Reports will be appended to this file for each round.",
+    )
     return parser.parse_args()
 
 
@@ -114,13 +124,12 @@ def build_agent_args(
         "task_ids": target_task_ids,
         "catalog": "",
         "database": "",
-        "domain": "",
-        "layer1": "",
-        "layer2": "",
+        "subject_path": None,
         "current_date": None,
         "workflow": cli_args.workflow,
         "output_file": str(evaluation_file),
         "max_workers": cli_args.max_workers,
+        "summary_report_file": cli_args.summary_report_file,
     }
     return argparse.Namespace(**common_kwargs)
 

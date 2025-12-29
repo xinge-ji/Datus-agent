@@ -420,7 +420,7 @@ class CustomSqlLexer(SqlLexer):
         "root": [
             (rf"@Table(?:\s+{REFERENCE_PATH_REGEX})?", Token.AtTables),
             (rf"@Metrics(?:\s+{REFERENCE_PATH_REGEX})?", Token.AtMetrics),
-            (rf"@ReferenceSql(?:\s+{REFERENCE_PATH_REGEX})?", Token.AtReferenceSql),
+            (rf"@Sql(?:\s+{REFERENCE_PATH_REGEX})?", Token.AtReferenceSql),
             (r"@File(?:\s+[^\r\n@]+)?", Token.AtFiles),
         ]
         + SqlLexer.tokens["root"],
@@ -764,17 +764,21 @@ class MetricsCompleter(DynamicAtReferenceCompleter):
         from datus.storage.cache import get_storage_cache_instance
 
         storage = get_storage_cache_instance(self.agent_config).metrics_storage()
-        data = storage.search_all(select_fields=["domain", "layer1", "layer2", "name", "llm_text"])
+        data = storage.search_all_metrics()
 
         result = {}
         for metric in data:
-            domain = metric.get("domain", "unknown")
-            layer1 = metric.get("layer1", "unknown")
-            layer2 = metric.get("layer2", "unknown")
+            subject_path = metric.get("subject_path", [])
             name = metric.get("name", "unknown")
             llm_text = metric.get("llm_text", "")
-            insert_into_dict_with_dict(result, [domain, layer1, layer2], name, llm_text)
-            self.flatten_data[f"{domain}.{layer1}.{layer2}.{name}"] = {
+
+            # Build nested dict using subject_path
+            if subject_path:
+                insert_into_dict_with_dict(result, subject_path, name, llm_text)
+
+            # Flatten key uses "/" separator
+            flatten_key = "/".join(subject_path + [name]) if subject_path else name
+            self.flatten_data[flatten_key] = {
                 "name": name,
                 "llm_text": llm_text,
             }
@@ -792,17 +796,19 @@ class ReferenceSqlCompleter(DynamicAtReferenceCompleter):
         from datus.storage.reference_sql.store import ReferenceSqlRAG
 
         storage = ReferenceSqlRAG(self.agent_config)
-        search_data = storage.search_all_reference_sql(domain="")
+        search_data = storage.search_all_reference_sql()
         result = {}
         for item in search_data:
-            domain = item["domain"]
-            layer1 = item["layer1"]
-            layer2 = item["layer2"]
+            subject_path = item.get("subject_path", [])
             name = item["name"]
 
-            insert_into_dict_with_dict(result, [domain, layer1, layer2], name, item["summary"])
+            # Build nested dict using subject_path
+            if subject_path:
+                insert_into_dict_with_dict(result, subject_path, name, item["summary"])
 
-            self.flatten_data[f"{domain}.{layer1}.{layer2}.{name}"] = {
+            # Flatten key uses "/" separator
+            flatten_key = "/".join(subject_path + [name]) if subject_path else name
+            self.flatten_data[flatten_key] = {
                 "name": name,
                 "comment": item["comment"],
                 "summary": item["summary"],
@@ -850,13 +856,13 @@ class AtReferenceCompleter(Completer):
         self.completer_dict = {
             "Table": self.table_completer,
             "Metrics": self.metric_completer,
-            "ReferenceSql": self.sql_completer,
+            "Sql": self.sql_completer,
             "File": self.file_completer,
         }
         self.type_options = {
             "Table": "📊 Table",
             "Metrics": "📈 Metrics",
-            "ReferenceSql": "💻 ReferenceSql",
+            "Sql": "💻 Sql",
             "File": "📁 File",
         }
 
@@ -934,7 +940,7 @@ class AtReferenceCompleter(Completer):
                     formatted = self.sql_completer.format_path_for_completion(match)
                     display = f"💻 {formatted}"
                     yield Completion(
-                        f"@ReferenceSql {formatted}", start_position=-len(prefix), display=display, style="class:fuzzy"
+                        f"@Sql {formatted}", start_position=-len(prefix), display=display, style="class:fuzzy"
                     )
 
                 for file_path in file_matches:
@@ -1033,7 +1039,7 @@ class SubagentCompleter(Completer):
 
 class AtReferenceParser:
     """
-    Independent parser for extracting @Table, @Metrics, and @ReferenceSql references from text.
+    Independent parser for extracting @Table, @Metrics, and @Sql references from text.
     This parser only extracts the reference paths, not the actual data.
     """
 
@@ -1043,7 +1049,7 @@ class AtReferenceParser:
         self.patterns = {
             "Table": re.compile(rf"@Table\s+({REFERENCE_PATH_REGEX})", re.IGNORECASE),
             "Metrics": re.compile(rf"@Metrics\s+({REFERENCE_PATH_REGEX})", re.IGNORECASE),
-            "Sqls": re.compile(rf"@ReferenceSql\s+({REFERENCE_PATH_REGEX})", re.IGNORECASE),
+            "Sqls": re.compile(rf"@Sql\s+({REFERENCE_PATH_REGEX})", re.IGNORECASE),
         }
 
     def parse_input(self, text: str) -> Dict[str, List[str]]:
